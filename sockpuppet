@@ -1,0 +1,19 @@
+#!/usr/bin/env perl
+# Sockpuppet: record HTTP streams
+#
+# Usage: ./sockpuppet [listenport] [desthost:][destport] > outfile.pl
+# e.g.   ./sockpuppet 3001 localhost:3000 > session.pl
+#
+# Sockpuppet isn't a completely transparent proxy. In particular, it applies a
+# few HTTP-level transformations that make it easier to model the resulting
+# traffic:
+#
+# 1. HTTP/1.1 and HTTP/2 requests are rewritten as HTTP/1.0 requests. This
+#    disables multiplexing and default keepalive.
+# 2. Connection-keepalive headers are removed from requests.
+# 3. "Accept-Encoding" headers are removed from requests. This disables
+#    compressed replies from the server.
+
+use strict;
+use warnings;
+use Socket;
