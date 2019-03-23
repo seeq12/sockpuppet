@@ -13,7 +13,29 @@
 # 2. Connection-keepalive headers are removed from requests.
 # 3. "Accept-Encoding" headers are removed from requests. This disables
 #    compressed replies from the server.
+# 4. Chunked transfers are converted to regular ones by removing the
+#    "Transfer-Encoding" header and replacing it with a content length.
 
+use v5.14;
 use strict;
 use warnings;
 use Socket;
+
+
+# HTTP session class
+
+package sockpuppet::http_session;
+
+
+# Websocket session class
+
+package sockpuppet::ws_session;
+
+
+# Proxy class
+# Manages a series of child processes, one to manage each socket pair. Their
+# STDOUT stream summaries are collected into annotated buffers.
+
+package sockpuppet::proxy;
+
+
