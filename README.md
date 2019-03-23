@@ -5,6 +5,17 @@ idea is that if you do something with a browser, you can automate it with
 sockpuppet.
 
 
+## Usage
+```sh
+# Proxy port 3001 to localhost:3000, recording the resulting script to
+# output.pl:
+$ ./sockpuppet 3001 localhost:3000 > output.pl
+```
+
+You can now issue web requests to `http://localhost:3001`, each of which will be
+bidirectionally logged into `output.pl`.
+
+
 ## MIT license
 Copyright 2019 Spencer Tipping
 
