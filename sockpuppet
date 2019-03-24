@@ -259,6 +259,10 @@ sub io_loop
     @$cs = grep $_->is_ok, @$cs;
     $_->prepare_select($rfds, $wfds, $efds) for @$cs;
 
+    # TODO: this select() logic isn't quite right. We need to look for readable
+    # sockets and then custom-build the write mask for just those sockets.
+    # Otherwise we'll spinloop if we have non-paired reads and writes.
+
     my $ncs = @$cs;
     print STDERR "about to select among [@$cs]...\n";
     my $nw = length $wfds && select undef, $wfds, undef, undef;
