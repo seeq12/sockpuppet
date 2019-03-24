@@ -15,6 +15,7 @@
 #    compressed replies from the server.
 # 4. Chunked transfers are converted to regular ones by removing the
 #    "Transfer-Encoding" header and replacing it with a content length.
+# 5. The Host header is fixed up to represent the destination.
 
 use v5.14;
 use strict;
@@ -50,7 +51,7 @@ sub write
   my $self = shift;
   my $file = $$self{file};
   for (my ($offset, $len, $n) = (0, length $_[0], 0);
-       $len and $n = syswrite($file, $_[0], $offset, $len) // die $!;
+       $len and $n = syswrite($file, $_[0], $len, $offset) // die $!;
        $offset += $n, $len -= $n) {}
   $self;
 }
@@ -95,15 +96,21 @@ use constant BUF_SIZE => 65536;
 
 sub new
 {
-  my ($class, $ostream, $client_sock, $server_sock) = @_;
+  my ($class, $ostream, $host, $client_sock, $server_sock) = @_;
   bless { ostream      => $ostream,
           client_sock  => $client_sock,
           server_sock  => $server_sock,
           client_fd    => fileno $client_sock,
           server_fd    => fileno $server_sock,
+          host         => $host,
           protocol     => undef,
           uplink_buf   => "",
           downlink_buf => "" }, $class;
+}
+
+sub is_ok
+{
+  defined shift->{client_sock};
 }
 
 sub close
@@ -121,29 +128,37 @@ sub close
 
 sub prepare_select
 {
-  # ($self, $read_fd_vec, $write_fd_vec); modifies vectors in place
+  # ($self, $read_fd_vec, $write_fd_vec, $err_vec); modifies vectors in place
   my $self = shift;
   vec($_[0], $$self{client_fd}, 1) = 1;
   vec($_[1], $$self{client_fd}, 1) = 1;
+  vec($_[2], $$self{client_fd}, 1) = 1;
   vec($_[0], $$self{server_fd}, 1) = 1;
   vec($_[1], $$self{server_fd}, 1) = 1;
+  vec($_[2], $$self{server_fd}, 1) = 1;
   $self;
 }
 
 sub do_io
 {
-  my ($self, $rfds, $wfds) = @_;
+  my ($self, $rfds, $wfds, $efds) = @_;
   my $client_r = vec $rfds, $$self{client_fd}, 1;
   my $client_w = vec $wfds, $$self{client_fd}, 1;
+  my $client_e = vec $efds, $$self{client_fd}, 1;
   my $server_r = vec $rfds, $$self{server_fd}, 1;
   my $server_w = vec $wfds, $$self{server_fd}, 1;
+  my $server_e = vec $efds, $$self{server_fd}, 1;
+
+  # If we have errors, auto-implode.
+  return $self->close if $client_e || $server_e;
 
   # First handle downlink. We don't parse this.
   my $downbuf_size = length $$self{downlink_buf};
   if ($server_r && $downbuf_size < BUF_SIZE)
   {
     sysread $$self{server_sock}, $$self{downlink_buf},
-            BUF_SIZE - $downbuf_size, $downbuf_size;
+            BUF_SIZE - $downbuf_size, $downbuf_size
+      or return $self->close;
     $$self{ostream}->download(substr $$self{downlink_buf}, $downbuf_size);
   }
 
@@ -159,9 +174,10 @@ sub do_io
   {
     sysread $$self{client_sock}, $$self{uplink_buf},
             defined $$self{protocol} ? BUF_SIZE - $upbuf_size : BUF_SIZE,
-            $upbuf_size // die $!;
+            $upbuf_size
+      or return $self->close;
     $$self{ostream}->upload(substr $$self{uplink_buf}, $upbuf_size);
-    $self->parse_protocol;
+    $self->parse_protocol unless defined $$self{protocol};
   }
 
   if (defined $$self{protocol} && $server_w)
@@ -187,6 +203,7 @@ sub parse_protocol
   $http =~ s/ HTTP\/2\S*$/ HTTP\/1.1/m;
   $http =~ s/^Accept-Encoding:.*\n//m;
   $http =~ s/^Connection:.*\n//m;
+  $http =~ s/^Host:.*/Host: $$self{host}/m;
   $$self{protocol} = 'http-plain';
 
   $$self{ostream}->log("rewriting uplink buffer",
@@ -221,6 +238,8 @@ sub new
   bless { connections   => [],
           output_stream => sockpuppet::ostream->new(\*STDOUT),
           dest_paddr    => $dest_paddr,
+          dest_host     => $dest_host,
+          dest_port     => $dest_port,
           server_fd     => fileno $server_socket,
           server_socket => $server_socket }, $class;
 }
@@ -228,20 +247,26 @@ sub new
 sub io_loop
 {
   my ($self) = @_;
+  my $cs = $$self{connections};
+
   while (1)
   {
     my $rfds = "";
     my $wfds = "";
+    my $efds = "";
     vec($rfds, $$self{server_fd}, 1) = 1;
+    vec($efds, $$self{server_fd}, 1) = 1;
 
-    $_->prepare_select($rfds, $wfds) for @{$$self{connections}};
+    @$cs = grep $_->is_ok, @$cs;
+    $_->prepare_select($rfds, $wfds, $efds) for @$cs;
 
-    print STDERR "about to select...\n";
-    my $n = select $rfds, $wfds, undef, undef;
+    my $ncs = @$cs;
+    print STDERR "about to select among $ncs connections...\n";
+    my $n = select $rfds, $wfds, $efds, undef;
     print STDERR "done: $n fd(s)\n";
 
     # First, do IO on existing connections.
-    $_->do_io($rfds, $wfds) for @{$$self{connections}};
+    $_->do_io($rfds, $wfds, $efds) for @$cs;
 
     # Now accept any connections on the inbound port.
     if (vec $rfds, $$self{server_fd}, 1)
@@ -252,11 +277,11 @@ sub io_loop
       socket my $server_sock, PF_INET, SOCK_STREAM, getprotobyname "tcp" or die "socket: $!";
       connect   $server_sock, $$self{dest_paddr}                         or die "connect: $!";
 
-      push @{$$self{connections}},
-           sockpuppet::connection->new(
-             sockpuppet::ostream->new(\*STDOUT),
-             $client_sock,
-             $server_sock);
+      push @$cs, sockpuppet::connection->new(
+                   sockpuppet::ostream->new(\*STDOUT),
+                   "$$self{dest_host}:$$self{dest_port}",
+                   $client_sock,
+                   $server_sock);
     }
   }
 }
