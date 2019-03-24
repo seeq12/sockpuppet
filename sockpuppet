@@ -202,8 +202,9 @@ sub parse_protocol
   my $old_http = $http;
   $http =~ s/ HTTP\/2\S*$/ HTTP\/1.1/m;
   $http =~ s/^Accept-Encoding:.*\n//m;
-  $http =~ s/^Connection:.*\n/Connection: close\n/m;
+  $http =~ s/^Connection:.*\n//m;
   $http =~ s/^Host:.*/Host: $$self{host}/m;
+  $http .= "\nConnection: close";
   $$self{protocol} = 'http-plain';
 
   $$self{ostream}->log("rewriting uplink buffer",
