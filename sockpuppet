@@ -202,7 +202,7 @@ sub parse_protocol
   my $old_http = $http;
   $http =~ s/ HTTP\/2\S*$/ HTTP\/1.1/m;
   $http =~ s/^Accept-Encoding:.*\n//m;
-  $http =~ s/^Connection:.*\n//m;
+  $http =~ s/^Connection:.*\n/Connection: close\n/m;
   $http =~ s/^Host:.*/Host: $$self{host}/m;
   $$self{protocol} = 'http-plain';
 
@@ -255,15 +255,15 @@ sub io_loop
     my $wfds = "";
     my $efds = "";
     vec($rfds, $$self{server_fd}, 1) = 1;
-    vec($efds, $$self{server_fd}, 1) = 1;
 
     @$cs = grep $_->is_ok, @$cs;
     $_->prepare_select($rfds, $wfds, $efds) for @$cs;
 
     my $ncs = @$cs;
-    print STDERR "about to select among $ncs connections...\n";
-    my $n = select $rfds, $wfds, $efds, undef;
-    print STDERR "done: $n fd(s)\n";
+    print STDERR "about to select among [@$cs]...\n";
+    my $nw = length $wfds && select undef, $wfds, undef, undef;
+    my $nr = select $rfds, undef, $efds, undef;
+    print STDERR "done: ($nr, $nw) fd(s)\n";
 
     # First, do IO on existing connections.
     $_->do_io($rfds, $wfds, $efds) for @$cs;
