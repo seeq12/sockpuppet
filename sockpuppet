@@ -1,7 +1,7 @@
 #!/usr/bin/env perl
 # Sockpuppet: record HTTP streams
 #
-# Usage: ./sockpuppet [listenport] [desthost:][destport] > outfile.pl
+# Usage: ./sockpuppet listenport host:destport > outfile.pl
 # e.g.   ./sockpuppet 3001 localhost:3000 > session.pl
 #
 # Sockpuppet isn't a completely transparent proxy. In particular, it applies a
@@ -19,23 +19,239 @@
 use v5.14;
 use strict;
 use warnings;
-use Socket;
 
 
-# HTTP session class
+# CLI logic
+my ($listenport, $dest) = @ARGV;
+my ($desthost, $destport) = split /:/, $dest;
+sockpuppet::proxy->new($listenport, $desthost, $destport)->io_loop;
 
-package sockpuppet::http_session;
+
+# Output stream
+# Logs information about a specific TCP connection. The output file is written
+# sequentially and safely, assuming you don't access it from multiple threads.
+
+package sockpuppet::ostream;
+use Time::HiRes qw/time/;
+
+our $stream_id = 0;
+
+sub new
+{
+  my ($class, $file) = @_;
+  my $self = bless { file => $file,
+                     id   => ++$stream_id }, $class;
+  $self->connect;
+  $self;
+}
+
+sub write
+{
+  my $self = shift;
+  my $file = $$self{file};
+  for (my ($offset, $len, $n) = (0, length $_[0], 0);
+       $len and $n = syswrite($file, $_[0], $offset, $len) // die $!;
+       $offset += $n, $len -= $n) {}
+  $self;
+}
+
+sub connect
+{
+  my ($self) = @_;
+  $self->write("$$self{id} connecting at " . time() . "\n");
+}
+
+sub upload
+{
+  my $self = shift;
+  $self->write("$$self{id} up: " . length($_[0]) . " byte(s)\n");
+}
+
+sub download
+{
+  my $self = shift;
+  $self->write("$$self{id} down: " . length($_[0]) . " byte(s)\n");
+}
+
+sub disconnect
+{
+  my ($self) = @_;
+  $self->write("$$self{id} disconnecting at " . time() . "\n");
+}
+
+sub log
+{
+  my $self = shift;
+  $self->write("$$self{id} LOG at " . time() . "\n" . join("\n", @_) . "\n");
+}
 
 
-# Websocket session class
+# TCP connection class
+# Manages data capture and protocol decoding.
 
-package sockpuppet::ws_session;
+package sockpuppet::connection;
+
+use constant BUF_SIZE => 65536;
+
+sub new
+{
+  my ($class, $ostream, $client_sock, $server_sock) = @_;
+  bless { ostream      => $ostream,
+          client_sock  => $client_sock,
+          server_sock  => $server_sock,
+          client_fd    => fileno $client_sock,
+          server_fd    => fileno $server_sock,
+          protocol     => undef,
+          uplink_buf   => "",
+          downlink_buf => "" }, $class;
+}
+
+sub close
+{
+  my ($self) = @_;
+  syswrite $$self{client_sock}, $$self{downlink_buf} if length $$self{downlink_buf};
+  syswrite $$self{server_sock}, $$self{uplink_buf}   if length $$self{uplink_buf};
+  close $$self{client_sock};
+  close $$self{server_sock};
+
+  $$self{ostream}->disconnect;
+  $$self{client_sock} = $$self{server_sock} = undef;
+  $self;
+}
+
+sub prepare_select
+{
+  # ($self, $read_fd_vec, $write_fd_vec); modifies vectors in place
+  my $self = shift;
+  vec($_[0], $$self{client_fd}, 1) = 1;
+  vec($_[1], $$self{client_fd}, 1) = 1;
+  vec($_[0], $$self{server_fd}, 1) = 1;
+  vec($_[1], $$self{server_fd}, 1) = 1;
+  $self;
+}
+
+sub do_io
+{
+  my ($self, $rfds, $wfds) = @_;
+  my $client_r = vec $rfds, $$self{client_fd}, 1;
+  my $client_w = vec $wfds, $$self{client_fd}, 1;
+  my $server_r = vec $rfds, $$self{server_fd}, 1;
+  my $server_w = vec $wfds, $$self{server_fd}, 1;
+
+  # First handle downlink. We don't parse this.
+  my $downbuf_size = length $$self{downlink_buf};
+  if ($server_r && $downbuf_size < BUF_SIZE)
+  {
+    sysread $$self{server_sock}, $$self{downlink_buf},
+            BUF_SIZE - $downbuf_size, $downbuf_size;
+    $$self{ostream}->download(substr $$self{downlink_buf}, $downbuf_size);
+  }
+
+  if ($client_w && length $$self{downlink_buf})
+  {
+    my $n = syswrite($$self{client_sock}, $$self{downlink_buf}) // die $!;
+    $$self{downlink_buf} = substr $$self{downlink_buf}, $n;
+  }
+
+  # Now handle uplink.
+  my $upbuf_size = length $$self{uplink_buf};
+  if ($client_r and !defined $$self{protocol} || $upbuf_size < BUF_SIZE)
+  {
+    sysread $$self{client_sock}, $$self{uplink_buf},
+            defined $$self{protocol} ? BUF_SIZE - $upbuf_size : BUF_SIZE,
+            $upbuf_size // die $!;
+    $$self{ostream}->upload(substr $$self{uplink_buf}, $upbuf_size);
+    $self->parse_protocol;
+  }
+
+  if (defined $$self{protocol} && $server_w)
+  {
+    my $n = syswrite($$self{server_sock}, $$self{uplink_buf}) // die $!;
+    $$self{uplink_buf} = substr $$self{uplink_buf}, $n;
+  }
+
+  $self;
+}
+
+sub parse_protocol
+{
+  my ($self) = @_;
+  die "already have a protocol: $$self{protocol}" if defined $$self{protocol};
+
+  # Look for the \r?\n\r?\n sequence that marks end of HTTP headers. Once we
+  # have that, we can rewrite our HTTP request and set the protocol.
+  my ($http, $rest) = $$self{uplink_buf} =~ /^(.*)\r?\n\r?\n(.*)$/s
+    or return $self;
+
+  my $old_http = $http;
+  $http =~ s/ HTTP\/2\S*$/ HTTP\/1.1/m;
+  $http =~ s/^Accept-Encoding:.*\n//m;
+  $http =~ s/^Connection:.*\n//m;
+  $$self{protocol} = 'http-plain';
+
+  $$self{ostream}->log("rewriting uplink buffer",
+                       "<<<<<",
+                       $old_http,
+                       "=====",
+                       $http,
+                       ">>>>>");
+
+  $$self{uplink_buf} = "$http\n\n$rest";
+  $self;
+}
 
 
 # Proxy class
-# Manages a series of child processes, one to manage each socket pair. Their
-# STDOUT stream summaries are collected into annotated buffers.
+# Manages state involving multiple TCP connections.
 
 package sockpuppet::proxy;
+use Socket;
 
+sub new
+{
+  my ($class, $source_port, $dest_host, $dest_port) = @_;
 
+  socket my $server_socket, PF_INET, SOCK_STREAM, getprotobyname "tcp"
+    or die "socket: $!";
+  setsockopt $server, SOL_SOCKET, SO_REUSEADDR, pack l => 1
+    or die "setsockopt: $!";
+  bind $server, sockaddr_in $source_port, INADDR_LOOPBACK or die "bind: $!";
+  listen $server, SOMAXCONN                               or die "listen: $!";
+
+  bless { connections   => [],
+          output_stream => sockpuppet::ostream->new(\*STDOUT),
+          server_fd     => fileno $server_socket,
+          server_socket => $server_socket }, $class;
+}
+
+sub io_loop
+{
+  my ($self) = @_;
+  while (1)
+  {
+    my $rfds = "";
+    my $wfds = "";
+    vec($rfds, $$self{server_fd}, 1) = 1;
+
+    $_->prepare_select($rfds, $wfds) for @{$$self{connections}};
+
+    print STDERR "about to select...\n";
+    my $n = select $rfds, $wfds, undef, 0;
+    print STDERR "done: $n fd(s)\n";
+
+    # First, do IO on existing connections.
+    $_->do_io($rfds, $wfds) for @{$$self{connections}};
+
+    # Now accept any connections on the inbound port.
+    if (vec $rfds, $$self{server_fd}, 1)
+    {
+      my $paddr = accept(my $client_sock, my $server_sock);
+      my ($port, $iaddr) = sockaddr_in $paddr;
+      push @{$$self{connections}},
+           sockpuppet::connection->new(
+             sockpuppet::ostream->new(\*STDOUT),
+             $client_sock,
+             $server_sock);
+    }
+  }
+}
