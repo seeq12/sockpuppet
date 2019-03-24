@@ -4,6 +4,13 @@
 # Usage: ./sockpuppet listenport host:destport > outfile
 # e.g.   ./sockpuppet 3001 localhost:3000 > session
 #
+# You can also extend sockpuppet by using it from another perl script:
+#
+#   BEGIN { do "sockpuppet" or die }    # import sockpuppet:: stuff
+#   my $proxy = sockpuppet::proxy->new(3001, "localhost", 3000);
+#   ...                                 # customize $proxy if you want to
+#   $proxy->io_loop;                    # never returns
+#
 # Sockpuppet isn't a completely transparent proxy. In particular, it applies a
 # few HTTP-level transformations that make it easier to model the resulting
 # traffic:
@@ -27,7 +34,8 @@ unless (caller)
 {
   my ($listenport, $dest) = @ARGV;
   my ($desthost, $destport) = split /:/, $dest;
-  sockpuppet::proxy->new($listenport, $desthost, $destport)->io_loop;
+  sockpuppet::proxy->new($listenport, $desthost, $destport)
+                   ->io_loop;
 }
 
 
@@ -291,3 +299,6 @@ sub io_loop
     }
   }
 }
+
+
+1;
