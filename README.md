@@ -7,13 +7,26 @@ sockpuppet.
 
 ## Usage
 ```sh
-# Proxy port 3001 to localhost:3000, recording the resulting script to
-# output.pl:
-$ ./sockpuppet 3001 localhost:3000 > output.pl
+# Proxy port 3001 to localhost:3000, recording the resulting script to output:
+$ ./sockpuppet 3001 localhost:3000 > output
 ```
 
 You can now issue web requests to `http://localhost:3001`, each of which will be
-bidirectionally logged into `output.pl`.
+bidirectionally logged into `output`.
+
+
+## Output format
+Lines of JSON, each describing a socket-level event that happened. Each output
+record contains at least these three fields:
+
+- `connid`: the ID of the TCP connection (an integer)
+- `time`: a UNIX timestamp with fractional seconds
+- `type`: the type of event that occurred -- more below
+
+### Event types
+- `connect`: a TCP `connect()` happened and was accepted; the socket is now open
+- `disconnectd`: somebody disconnected; the socket is now closed
+- **TODO:** write something really smart here
 
 
 ## MIT license

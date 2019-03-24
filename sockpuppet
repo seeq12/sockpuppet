@@ -1,8 +1,8 @@
 #!/usr/bin/env perl
 # Sockpuppet: record HTTP streams
 #
-# Usage: ./sockpuppet listenport host:destport > outfile.pl
-# e.g.   ./sockpuppet 3001 localhost:3000 > session.pl
+# Usage: ./sockpuppet listenport host:destport > outfile
+# e.g.   ./sockpuppet 3001 localhost:3000 > session
 #
 # Sockpuppet isn't a completely transparent proxy. In particular, it applies a
 # few HTTP-level transformations that make it easier to model the resulting
@@ -13,9 +13,7 @@
 #    connection-close header.
 # 3. "Accept-Encoding" headers are removed from requests. This disables
 #    compressed replies from the server.
-# 4. Chunked transfers are converted to regular ones by removing the
-#    "Transfer-Encoding" header and replacing it with a content length.
-# 5. The Host header is fixed up to represent the destination.
+# 4. The Host header is fixed up to represent the destination.
 
 use v5.14;
 use strict;
@@ -31,6 +29,10 @@ sockpuppet::proxy->new($listenport, $desthost, $destport)->io_loop;
 # Output stream
 # Logs information about a specific TCP connection. The output file is written
 # sequentially and safely, assuming you don't access it from multiple threads.
+#
+# TODO: have output streams take on a parsing and interpreting role, for
+# instance characterizing the nature of HTTP requests/replies (e.g. JSON
+# objects) and decoding stuff like chunked encodings and websockets.
 
 package sockpuppet::ostream;
 use Time::HiRes qw/time/;
@@ -103,7 +105,7 @@ sub new
           client_fd    => fileno $client_sock,
           server_fd    => fileno $server_sock,
           host         => $host,
-          protocol     => undef,
+          http_decoded => 0,
           uplink_buf   => "",
           downlink_buf => "" }, $class;
 }
@@ -126,16 +128,23 @@ sub close
   $self;
 }
 
-sub prepare_select
+sub prepare_select_read
 {
-  # ($self, $read_fd_vec, $write_fd_vec, $err_vec); modifies vectors in place
+  # ($self, $read_fd_vec, $err_fd_vec)
   my $self = shift;
   vec($_[0], $$self{client_fd}, 1) = 1;
   vec($_[1], $$self{client_fd}, 1) = 1;
-  vec($_[2], $$self{client_fd}, 1) = 1;
   vec($_[0], $$self{server_fd}, 1) = 1;
   vec($_[1], $$self{server_fd}, 1) = 1;
-  vec($_[2], $$self{server_fd}, 1) = 1;
+  $self;
+}
+
+sub prepare_select_write
+{
+  # ($self, $read_fd_vec, $err_fd_vec, $write_fd_vec)
+  my $self = shift;
+  vec($_[2], $$self{client_fd}, 1) = 1 if vec $_[0], $$self{server_fd}, 1;
+  vec($_[2], $$self{server_fd}, 1) = 1 if vec $_[0], $$self{client_fd}, 1;
   $self;
 }
 
@@ -170,17 +179,17 @@ sub do_io
 
   # Now handle uplink.
   my $upbuf_size = length $$self{uplink_buf};
-  if ($client_r and !defined $$self{protocol} || $upbuf_size < BUF_SIZE)
+  if ($client_r and !$$self{http_decoded} || $upbuf_size < BUF_SIZE)
   {
     sysread $$self{client_sock}, $$self{uplink_buf},
-            defined $$self{protocol} ? BUF_SIZE - $upbuf_size : BUF_SIZE,
+            $$self{http_decoded} ? BUF_SIZE - $upbuf_size : BUF_SIZE,
             $upbuf_size
       or return $self->close;
     $$self{ostream}->upload(substr $$self{uplink_buf}, $upbuf_size);
-    $self->parse_protocol unless defined $$self{protocol};
+    $self->parse_http unless $$self{http_decoded};
   }
 
-  if (defined $$self{protocol} && $server_w)
+  if ($$self{http_decoded} && $server_w)
   {
     my $n = syswrite($$self{server_sock}, $$self{uplink_buf}) // die $!;
     $$self{uplink_buf} = substr $$self{uplink_buf}, $n;
@@ -189,30 +198,23 @@ sub do_io
   $self;
 }
 
-sub parse_protocol
+sub parse_http
 {
   my ($self) = @_;
-  die "already have a protocol: $$self{protocol}" if defined $$self{protocol};
+  die "already parsed upload HTTP headers" if $$self{http_decoded};
 
   # Look for the \r?\n\r?\n sequence that marks end of HTTP headers. Once we
-  # have that, we can rewrite our HTTP request and set the protocol.
+  # have that, we can rewrite our HTTP request and mark ourselves as having
+  # decoded the outbound HTTP.
   my ($http, $rest) = $$self{uplink_buf} =~ /^(.*)\r?\n\r?\n(.*)$/s
     or return $self;
 
-  my $old_http = $http;
   $http =~ s/ HTTP\/2\S*$/ HTTP\/1.1/m;
   $http =~ s/^Accept-Encoding:.*\n//m;
   $http =~ s/^Connection:.*\n//m;
   $http =~ s/^Host:.*/Host: $$self{host}/m;
   $http .= "\nConnection: close";
-  $$self{protocol} = 'http-plain';
-
-  $$self{ostream}->log("rewriting uplink buffer",
-                       "<<<<<",
-                       $old_http,
-                       "=====",
-                       $http,
-                       ">>>>>");
+  $$self{http_decoded} = 1;
 
   $$self{uplink_buf} = "$http\n\n$rest";
   $self;
@@ -258,17 +260,11 @@ sub io_loop
     vec($rfds, $$self{server_fd}, 1) = 1;
 
     @$cs = grep $_->is_ok, @$cs;
-    $_->prepare_select($rfds, $wfds, $efds) for @$cs;
+    $_->prepare_select_read($rfds, $efds) for @$cs;
+    select $rfds, undef, $efds, undef;
 
-    # TODO: this select() logic isn't quite right. We need to look for readable
-    # sockets and then custom-build the write mask for just those sockets.
-    # Otherwise we'll spinloop if we have non-paired reads and writes.
-
-    my $ncs = @$cs;
-    print STDERR "about to select among [@$cs]...\n";
-    my $nw = length $wfds && select undef, $wfds, undef, undef;
-    my $nr = select $rfds, undef, $efds, undef;
-    print STDERR "done: ($nr, $nw) fd(s)\n";
+    $_->prepare_select_write($rfds, $efds, $wfds) for @$cs;
+    select undef, $wfds, undef, undef if unpack "%32b*", $wfds;
 
     # First, do IO on existing connections.
     $_->do_io($rfds, $wfds, $efds) for @$cs;
