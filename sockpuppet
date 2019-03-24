@@ -211,15 +211,16 @@ sub new
 {
   my ($class, $source_port, $dest_host, $dest_port) = @_;
 
-  socket my $server_socket, PF_INET, SOCK_STREAM, getprotobyname "tcp"
-    or die "socket: $!";
-  setsockopt $server, SOL_SOCKET, SO_REUSEADDR, pack l => 1
-    or die "setsockopt: $!";
-  bind $server, sockaddr_in $source_port, INADDR_LOOPBACK or die "bind: $!";
-  listen $server, SOMAXCONN                               or die "listen: $!";
+  socket  my $server_socket, PF_INET, SOCK_STREAM, getprotobyname "tcp" or die "socket: $!";
+  setsockopt $server_socket, SOL_SOCKET, SO_REUSEADDR, pack l => 1      or die "setsockopt: $!";
+  bind       $server_socket, sockaddr_in $source_port, INADDR_LOOPBACK  or die "bind: $!";
+  listen     $server_socket, SOMAXCONN                                  or die "listen: $!";
+
+  my $dest_paddr = sockaddr_in $dest_port, inet_aton $dest_host || die "no host: $dest_host";
 
   bless { connections   => [],
           output_stream => sockpuppet::ostream->new(\*STDOUT),
+          dest_paddr    => $dest_paddr,
           server_fd     => fileno $server_socket,
           server_socket => $server_socket }, $class;
 }
@@ -236,7 +237,7 @@ sub io_loop
     $_->prepare_select($rfds, $wfds) for @{$$self{connections}};
 
     print STDERR "about to select...\n";
-    my $n = select $rfds, $wfds, undef, 0;
+    my $n = select $rfds, $wfds, undef, undef;
     print STDERR "done: $n fd(s)\n";
 
     # First, do IO on existing connections.
@@ -245,8 +246,12 @@ sub io_loop
     # Now accept any connections on the inbound port.
     if (vec $rfds, $$self{server_fd}, 1)
     {
-      my $paddr = accept(my $client_sock, my $server_sock);
-      my ($port, $iaddr) = sockaddr_in $paddr;
+      my $paddr = accept(my $client_sock, $$self{server_socket});
+
+      # Connect to the real server.
+      socket my $server_sock, PF_INET, SOCK_STREAM, getprotobyname "tcp" or die "socket: $!";
+      connect   $server_sock, $$self{dest_paddr}                         or die "connect: $!";
+
       push @{$$self{connections}},
            sockpuppet::connection->new(
              sockpuppet::ostream->new(\*STDOUT),
