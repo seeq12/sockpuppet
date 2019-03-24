@@ -21,9 +21,14 @@ use warnings;
 
 
 # CLI logic
-my ($listenport, $dest) = @ARGV;
-my ($desthost, $destport) = split /:/, $dest;
-sockpuppet::proxy->new($listenport, $desthost, $destport)->io_loop;
+# Don't do anything if we're being used as a library.
+
+unless (caller)
+{
+  my ($listenport, $dest) = @ARGV;
+  my ($desthost, $destport) = split /:/, $dest;
+  sockpuppet::proxy->new($listenport, $desthost, $destport)->io_loop;
+}
 
 
 # Output stream
