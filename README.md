@@ -18,24 +18,28 @@ bidirectionally logged into `output`.
 
 
 ## Output format
-Lines of JSON, each describing a socket-level event that happened. Each output
-record contains at least these three fields:
+TSV containing unidirectional events, each occupying a single row. Requests and
+responses are matched up using connection IDs, each of which is an integer. All
+headings (e.g. HTTP headers) and data are preserved verbatim and encoded as hex
+strings. For example, here's what a conversation with a server might look like
+(Sockpuppet does generate a `notes` column, and the ellipses wouldn't appear in
+real outputs):
 
-- `connid`: the ID of the TCP connection (an integer)
-- `time`: a UNIX timestamp with fractional seconds
-- `type`: the type of event that occurred -- more below
+| Time             | ConnID | Up/down | Protocol | Headings     | Data      | Notes           |
+| ---------------- | ------ | ------- | -------- | ------------ | --------- | --------------- |
+| 1553541453.1279  | 1      | up      | http     | `4745542`... |           | GET / HTTP/1.1  |
+| 1553541567.10688 | 2      | up      | http     | `4745542`... |           | GET /favico...  |
+| 1553541568.51422 | 2      | down    | http     | `4854545`... |           | HTTP/1.1 404... |
+| 1553541569.4118  | 1      | down    | http     | `4854545`... | `3c21`... | HTTP/1.1 200 OK |
 
-### Event types
-- `connect`: a TCP `connect()` happened and was accepted; the socket is now open
-- `disconnectd`: somebody disconnected; the socket is now closed
-- **TODO:** write something really smart here
+Sockpuppet also parses websocket frames, logging all of a websocket's traffic
+under a single connection ID.
 
 
-## MIT license
-Copyright 2019 Spencer Tipping, Seeq Inc.
+## Authors
+- [Spencer Tipping](https://github.com/spencertipping)
 
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
 
-The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+## License
+Sockpuppet is released under the MIT license. See [LICENSE.md](LICENSE.md) for
+details.
