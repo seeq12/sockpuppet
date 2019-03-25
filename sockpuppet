@@ -30,20 +30,6 @@
 #   my $proxy = sockpuppet::proxy->new(3001, "localhost", 3000);
 #   ...                                 # customize $proxy if you want to
 #   $proxy->io_loop;                    # never returns
-#
-# Sockpuppet isn't a completely transparent proxy. In particular, it applies a
-# few HTTP-level transformations that make it easier to model the resulting
-# traffic:
-#
-# 1. HTTP/2 requests are rewritten as HTTP/1.1.
-# 2. The Host header is fixed up to represent the destination as sockpuppet sees
-#    it, not as the browser connecting to sockpuppet.
-# 3. Connection-keepalive headers are removed from requests; we add a
-#    connection-close header to force a separate datastream per request.
-# 4. "Accept-Encoding" headers are removed from requests. This disables
-#    compressed replies from the server.
-#
-# Of these, (3) and (4) aren't strictly necessary but they do simplify analysis.
 
 use v5.14;
 use strict;
