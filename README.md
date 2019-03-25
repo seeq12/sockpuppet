@@ -4,6 +4,8 @@ that can be parameterized to form things like unit and performance tests. The
 idea is that if you do something with a browser, you can automate it with
 sockpuppet.
 
+**NOTE:** still in development; not ready for production use yet.
+
 
 ## Usage
 ```sh
