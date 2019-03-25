@@ -17,10 +17,11 @@
 #
 # 1. HTTP/2 requests are rewritten as HTTP/1.1.
 # 2. Connection-keepalive headers are removed from requests; we add a
-#    connection-close header.
+#    connection-close header to force a separate datastream per request.
 # 3. "Accept-Encoding" headers are removed from requests. This disables
 #    compressed replies from the server.
 # 4. The Host header is fixed up to represent the destination.
+
 
 use v5.14;
 use strict;
@@ -107,20 +108,20 @@ sub log
 
 package sockpuppet::connection;
 
-use constant BUF_SIZE => 65536;
+use constant BUF_LIMIT => 65536;
 
 sub new
 {
   my ($class, $ostream, $host, $client_sock, $server_sock) = @_;
-  bless { ostream      => $ostream,
-          client_sock  => $client_sock,
-          server_sock  => $server_sock,
-          client_fd    => fileno $client_sock,
-          server_fd    => fileno $server_sock,
-          host         => $host,
-          http_decoded => 0,
-          uplink_buf   => "",
-          downlink_buf => "" }, $class;
+  bless { ostream        => $ostream,
+          client_sock    => $client_sock,
+          server_sock    => $server_sock,
+          client_fd      => fileno $client_sock,
+          server_fd      => fileno $server_sock,
+          host           => $host,
+          http_rewritten => 0,
+          uplink_buf     => "",
+          downlink_buf   => "" }, $class;
 }
 
 sub is_ok
@@ -171,15 +172,15 @@ sub do_io
   my $server_w = vec $wfds, $$self{server_fd}, 1;
   my $server_e = vec $efds, $$self{server_fd}, 1;
 
-  # If we have errors, auto-implode.
+  # If we have errors, close the connection and auto-implode.
   return $self->close if $client_e || $server_e;
 
   # First handle downlink. We don't parse this.
   my $downbuf_size = length $$self{downlink_buf};
-  if ($server_r && $downbuf_size < BUF_SIZE)
+  if ($server_r && $downbuf_size < BUF_LIMIT)
   {
     sysread $$self{server_sock}, $$self{downlink_buf},
-            BUF_SIZE - $downbuf_size, $downbuf_size
+            BUF_LIMIT - $downbuf_size, $downbuf_size
       or return $self->close;
     $$self{ostream}->download(substr $$self{downlink_buf}, $downbuf_size);
   }
@@ -192,17 +193,21 @@ sub do_io
 
   # Now handle uplink.
   my $upbuf_size = length $$self{uplink_buf};
-  if ($client_r and !$$self{http_decoded} || $upbuf_size < BUF_SIZE)
+  if ($client_r and !$$self{http_rewritten} || $upbuf_size < BUF_LIMIT)
   {
     sysread $$self{client_sock}, $$self{uplink_buf},
-            $$self{http_decoded} ? BUF_SIZE - $upbuf_size : BUF_SIZE,
+            $$self{http_rewritten} ? BUF_LIMIT - $upbuf_size : BUF_LIMIT,
             $upbuf_size
       or return $self->close;
+
+    # The ostream's uplink follower gets original data, not our rewritten
+    # request. This shouldn't be a problem given the limited nature of our
+    # rewrites, but it's worth noting.
     $$self{ostream}->upload(substr $$self{uplink_buf}, $upbuf_size);
-    $self->parse_http unless $$self{http_decoded};
+    $self->rewrite_http_request unless $$self{http_rewritten};
   }
 
-  if ($$self{http_decoded} && $server_w)
+  if ($$self{http_rewritten} && $server_w)
   {
     my $n = syswrite($$self{server_sock}, $$self{uplink_buf}) // die $!;
     $$self{uplink_buf} = substr $$self{uplink_buf}, $n;
@@ -211,10 +216,10 @@ sub do_io
   $self;
 }
 
-sub parse_http
+sub rewrite_http_request
 {
   my ($self) = @_;
-  die "already parsed upload HTTP headers" if $$self{http_decoded};
+  die "already rewrote upload HTTP headers" if $$self{http_rewritten};
 
   # Look for the \r?\n\r?\n sequence that marks end of HTTP headers. Once we
   # have that, we can rewrite our HTTP request and mark ourselves as having
@@ -227,7 +232,7 @@ sub parse_http
   $http =~ s/^Connection:.*\n//m;
   $http =~ s/^Host:.*/Host: $$self{host}/m;
   $http .= "\nConnection: close";
-  $$self{http_decoded} = 1;
+  $$self{http_rewritten} = 1;
 
   $$self{uplink_buf} = "$http\n\n$rest";
   $self;
