@@ -292,7 +292,8 @@ defstreamstate websocket => sub
   # We always have a byte to work with if this function is called. And we always
   # need to grab it to track the data/ctrl start time, even if we don't have a
   # full frame prefix.
-  my $opcode = 15 & unpack C => $_[0];
+  my $b0     = unpack C => $_[0];
+  my $opcode = $b0 & 0x0f;
   $$f{$opcode & 8 ? "ws_ctrl_start_" : "ws_data_start_"} //= $start;
 
   # Early-exit for truncated frames.
@@ -308,8 +309,66 @@ defstreamstate websocket => sub
   my $frame_bytes = $length + length($frame) + ($masked ? 4 : 0);
   return undef unless length $_[0] >= $frame_bytes;
 
-  # ...aaaand finally, the moment we've all been waiting for...
-  # TODO: break the suspense
+  # ...aaaand finally, the moment we've all been waiting for.
+  #
+  # First, unmask the payload if it's masked.
+  my $fin     = $b0 & 0x80;
+  my $payload = substr $_[0], length($frame) + ($masked ? 4 : 0), $length;
+  my $mask    = $masked ? substr($_[0], length($frame), 4) x ($length + 3 >> 2)
+                        : "";
+  $payload ^= $mask if $masked;
+
+  # Commit by eating the frame from the data buffer
+  $_[0] = substr $_[0], length($frame) + ($masked ? 4 : 0);
+
+  # OK, now dispense with the data in one of four ways:
+  #
+  # 1. Control: event it immediately
+  # 2. Initial non-FIN: record header, buffer payload
+  # 3. Continuation non-FIN: discard header, buffer payload
+  # 4. FIN: assemble+event the data packet
+
+  if ($opcode & 8)
+  {
+    # Control packet
+    $f->event($opcode == 8  ? "close"
+            : $opcode == 9  ? "ping"
+            : $opcode == 10 ? "pong"
+            :                 "unknown op $opcode",
+              $frame . $mask,
+              $payload,
+              $$f{ws_ctrl_start_}, $end);
+    $$f{ws_ctrl_start_} = undef;
+    return $opcode == 8 ? 'eof' : undef;
+  }
+  elsif (!$fin && $opcode)
+  {
+    # Start the data buffer and record the packet type.
+    $$f{ws_data_header_} = $frame;
+    $$f{ws_data_buffer_} = $payload;
+    $$f{ws_data_type_}   = $opcode == 1 ? "text"
+                         : $opcode == 2 ? "binary"
+                         :                "unknown $opcode";
+    return undef;
+  }
+  elsif (!$fin)
+  {
+    # Append to the buffer and we're done.
+    $$f{ws_data_buffer_} .= $payload;
+    return undef;
+  }
+  else
+  {
+    # Event this puppy
+    $f->event($$f{ws_data_type_},
+              $$f{ws_data_header_},
+              $$f{ws_data_buffer_} . $payload,
+              $$f{ws_data_start_}, $end);
+    $$f{ws_data_buffer_} = "";
+    $$f{ws_data_type_}   = undef;
+    $$f{ws_data_start_}  = undef;
+    return undef;
+  }
 };
 
 
@@ -425,6 +484,11 @@ sub data
 sub close
 {
   my $self = shift->ping;
+  warn "closing a non-EOF follower with state $$self{state}, ID "
+     . "$$self{conn_id}; this usually means the protocol didn't have a chance "
+     . "to terminate before the socket was closed"
+  unless $$self{state} eq 'closed';
+
   $$self{state} = 'closed';
   return $self unless length $$self{buf};
 
