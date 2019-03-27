@@ -61,6 +61,7 @@ unless (caller)
   };
 
   sockpuppet::total_runtime->start;
+  print STDERR "sockpuppet: starting proxy; Ctrl+C to exit\n";
   sockpuppet::proxy->new($listenport, $desthost, $destport)
                    ->io_loop;
 }
@@ -174,26 +175,108 @@ sub streamstate
 
 defstreamstate http_length => sub
 {
-  # Log an event once we have the declared length-worth of stuff.
+  # Log an event once we have the declared length-worth of stuff. If this state
+  # is in use, the follower will have two fields on it:
+  #
+  #   http_headers_
+  #   http_content_length_
+
   my $f = shift;
-
-
-  ($$f{content_length}) = $_[0] =~ /Content-Length\s*:\s*(\d+)/i
-    unless exists $$f{content_length};
-
-
-  # Do we have all the content we expected? If so, log it and we're done.
-  
+  if (length $_[0] == $$f{http_content_length_})
+  {
+    $f->event($$f{http_status_},
+              $$f{http_headers_},
+              $_[0]);
+    $_[0] = "";
+    'eof';
+  }
+  undef;
 };
 
-defstreamstate http_req => sub
+defstreamstate http_chunked => sub
 {
+  # Accumulate chunked data in memory until we get EOF. It isn't technically
+  # difficult to emit intermediate events, but it makes our output format
+  # noisier.
+  #
+  # This function is always invoked with the buffer placed at the beginning of a
+  # chunk header. Data is accumulated in $$f{http_chunked_buffer_}.
+
   my $f = shift;
+  while ($_[0] =~ /^([0-9a-fA-F]+)\r\n/s)
+  {
+    my $h = $1;
+    my $n = hex $h;
+    if ($n)
+    {
+      $$f{http_chunked_buffer_} .= substr $_[0], length($h), $n;
+      $_[0] = substr $_[0], length($h) + $n + 4;
+    }
+    else
+    {
+      # End of stream
+      $f->event($$f{http_status_},
+                $$f{http_headers_},
+                $$f{http_chunked_buffer_});
+      $_[0] = "";
+      return 'eof';
+    }
+  }
+  undef;
 };
 
-defstreamstate http_res => sub
+defstreamstate http => sub
 {
+  # Once the headers have been parsed, we store http_headers_ and http_status_
+  # on the follower. We also parse the content-length header if we transfer to
+  # the http_length state.
   my $f = shift;
+  return undef unless $_[0] =~ /^(.*?)(\r?\n\r?\n)/s;
+
+  $$f{http_headers_} = $1;
+  $_[0] = substr $_[0], length($$f{http_headers_}) + length($2);
+
+  ($$f{http_status_}) = $$f{http_headers_} =~ /^(.*)/;
+
+  # Four possibilities once we have the headers.
+  #
+  # 1. Websocket upgrade -> 'websocket' state
+  # 2. Content-Length found: set substate to "length"
+  # 3. "Transfer-encoding: chunked" found: set substate to "chunked"
+  # 4. No content length or transfer encoding: transition to EOF state
+
+  if ($$f{http_headers_} =~ /connection\h*:\h*upgrade/i
+      && $$f{http_headers_} =~ /upgrade\h*:\h*websocket/i)
+  {
+    # All set: we are now a websocket.
+    delete $$f{http_state_};
+    $f->event('websocket upgrade', $$f{http_headers_}, "");
+    return 'websocket';
+  }
+  elsif ($$f{http_headers_} =~ /^content-length\h*:\h*(\d+)/mi)
+  {
+    $$f{http_content_length_} = $1;
+    $f->event("content-length: $$f{http_content_length}",
+              $$f{http_headers_},
+              "");
+    return 'http_length';
+  }
+  elsif ($$f{http_headers_} =~ /^transfer-encoding\h*:\h*chunked/mi)
+  {
+    $$f{http_chunked_buffer_} = "";
+    $f->event("transfer-encoding: chunked", $$f{http_headers_}, "");
+    return 'http_chunked';
+  }
+  else
+  {
+    $f->event($$f{http_status_}, $$f{http_headers_}, "");
+    return 'eof';
+  }
+};
+
+defstreamstate closed => sub
+{
+  die "no further data expected along (half?)closed socket: $_[1]";
 };
 
 defstreamstate eof => sub
@@ -257,8 +340,8 @@ sub event
   trace_overhead->start;
   sockpuppet::fd_write(
     $$self{trace_file},
-    join "\t", @$self{"start", "end", "connid", "updown", "state"},
-               $_[0],
+    join "\t", @$self{"start", "end", "conn_id", "updown", "state"},
+               $_[0] =~ y/\t/ /r,
                unpack("H*", $_[1]),
                unpack("H*", $_[2]) . "\n");
   trace_overhead->stop;
@@ -271,21 +354,25 @@ sub data
   $$self{buf} .= shift;
 
   # Parse link state. If we get a state change, collapse our timeframe on the
-  # assumption that the most recent data caused that change.
-  follower_parse_overhead->start;
-  my $s = sockpuppet::streamstate($$self{state})->(
-            $self, @$self{"buf", "start", "end"});
-  follower_parse_overhead->stop;
+  # assumption that the most recent data caused that change. Each state change
+  # also triggers a reparse under the new state.
+  while (1)
+  {
+    follower_parse_overhead->start;
+    my $s = sockpuppet::streamstate($$self{state})->(
+              $self, @$self{"buf", "start", "end"});
+    follower_parse_overhead->stop;
 
-  return $self unless defined $s;
-  sockpuppet::streamstate($$self{state} = $s);
-  $$self{start} = $$self{end};
-  $self;
+    return $self unless defined $s;
+    sockpuppet::streamstate($$self{state} = $s);
+    $$self{start} = $$self{end};
+  }
 }
 
 sub close
 {
   my $self = shift->ping;
+  $$self{state} = 'closed';
   return $self unless length $$self{buf};
 
   # If we have data in the buffer, it means we failed to process something. Log
@@ -332,8 +419,23 @@ sub is_ok
 sub close
 {
   my ($self) = @_;
-  syswrite $$self{client_sock}, $$self{downlink_buf} if length $$self{downlink_buf};
-  syswrite $$self{server_sock}, $$self{uplink_buf}   if length $$self{uplink_buf};
+
+  if (length $$self{downlink_buf})
+  {
+    # Download data is written to the follower on read, so no need to write it
+    # here.
+    sockpuppet::fd_write $$self{client_sock}, $$self{downlink_buf};
+  }
+
+  if (length $$self{uplink_buf})
+  {
+    $$self{up_follower}->data($$self{uplink_buf});
+    sockpuppet::fd_write $$self{server_sock}, $$self{uplink_buf};
+  }
+
+  $$self{down_follower}->close;
+  $$self{up_follower}->close;
+
   close $$self{client_sock};
   close $$self{server_sock};
 
@@ -433,7 +535,7 @@ sub rewrite_http_request
   my ($http, $rest) = $$self{uplink_buf} =~ /^(.*)\r?\n\r?\n(.*)$/s
     or return $self;
 
-  $http =~ s/ HTTP\/2\S*$/ HTTP\/1.1/m;
+  $http =~ s/^(.*) HTTP\/2\S*$/^$1 HTTP\/1.1/;
   $http =~ s/^Accept-Encoding:.*\n//m;
   $http =~ s/^Connection:.*\n//m;
   $http =~ s/^Host:.*/Host: $$self{host}/m;
@@ -462,57 +564,63 @@ sub new
 
   my $dest_paddr = sockaddr_in $dest_port, inet_aton $dest_host || die "no host: $dest_host";
 
-  bless { connections   => [],
-          trace_file    => \*STDOUT,
-          dest_paddr    => $dest_paddr,
-          dest_host     => $dest_host,
-          dest_port     => $dest_port,
-          server_fd     => fileno $server_socket,
-          server_socket => $server_socket }, $class;
+  bless { connections    => [],
+          trace_file     => \*STDOUT,
+          dest_paddr     => $dest_paddr,
+          dest_host      => $dest_host,
+          dest_port      => $dest_port,
+          dest_http_host => "$dest_host:$dest_port",
+          server_fd      => fileno $server_socket,
+          server_socket  => $server_socket }, $class;
+}
+
+sub io_step
+{
+  my ($self, $half_timeout) = @_;
+  my $cs = $$self{connections};
+
+  my $rfds = "";
+  my $wfds = "";
+  my $efds = "";
+  vec($rfds, $$self{server_fd}, 1) = 1;
+
+  @$cs = grep $_->is_ok, @$cs;
+  $_->prepare_select_read($rfds, $efds) for @$cs;
+  sockpuppet::select_loop_time->start;
+  select $rfds, undef, $efds, $half_timeout;
+  sockpuppet::select_loop_time->stop;
+
+  $_->prepare_select_write($rfds, $efds, $wfds) for @$cs;
+  sockpuppet::select_loop_time->start;
+  select undef, $wfds, undef, $half_timeout if unpack "%32b*", $wfds;
+  sockpuppet::select_loop_time->stop;
+
+  # First, do IO on existing connections.
+  $_->do_io($rfds, $wfds, $efds) for @$cs;
+
+  # Now accept any connections on the inbound port.
+  if (vec $rfds, $$self{server_fd}, 1)
+  {
+    my $paddr = accept(my $client_sock, $$self{server_socket});
+
+    # Connect to the real server.
+    socket my $server_sock, PF_INET, SOCK_STREAM, getprotobyname "tcp" or die "socket: $!";
+    connect   $server_sock, $$self{dest_paddr}                         or die "connect: $!";
+
+    push @$cs, sockpuppet::connection->new(
+                 $$self{trace_file},
+                 $$self{dest_http_host},
+                 $client_sock,
+                 $server_sock);
+  }
+
+  $self;
 }
 
 sub io_loop
 {
-  my ($self) = @_;
-  my $cs = $$self{connections};
-
-  while (1)
-  {
-    my $rfds = "";
-    my $wfds = "";
-    my $efds = "";
-    vec($rfds, $$self{server_fd}, 1) = 1;
-
-    @$cs = grep $_->is_ok, @$cs;
-    $_->prepare_select_read($rfds, $efds) for @$cs;
-    sockpuppet::select_loop_time->start;
-    select $rfds, undef, $efds, undef;
-    sockpuppet::select_loop_time->stop;
-
-    $_->prepare_select_write($rfds, $efds, $wfds) for @$cs;
-    sockpuppet::select_loop_time->start;
-    select undef, $wfds, undef, undef if unpack "%32b*", $wfds;
-    sockpuppet::select_loop_time->stop;
-
-    # First, do IO on existing connections.
-    $_->do_io($rfds, $wfds, $efds) for @$cs;
-
-    # Now accept any connections on the inbound port.
-    if (vec $rfds, $$self{server_fd}, 1)
-    {
-      my $paddr = accept(my $client_sock, $$self{server_socket});
-
-      # Connect to the real server.
-      socket my $server_sock, PF_INET, SOCK_STREAM, getprotobyname "tcp" or die "socket: $!";
-      connect   $server_sock, $$self{dest_paddr}                         or die "connect: $!";
-
-      push @$cs, sockpuppet::connection->new(
-                   $$self{trace_file},
-                   "$$self{dest_host}:$$self{dest_port}",
-                   $client_sock,
-                   $server_sock);
-    }
-  }
+  my $self = shift;
+  $self->io_step while 1;
 }
 
 

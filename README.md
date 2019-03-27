@@ -38,12 +38,12 @@ strings. For example, here's what a conversation with a server might look like
 (Sockpuppet does generate a `notes` column, and the ellipses wouldn't appear in
 real outputs):
 
-| Starttime        | Endtime          | ConnID | Up/down | State      | Notes           | Headings     | Data      |
-| ---------------- | ---------------- | ------ | ------- | ---------- | --------------- | ------------ | --------- |
-| 1553541453.1279  | 1553541453.1279  | 1      | up      | `http_req` | GET / HTTP/1.1  | `4745542`... |           |
-| 1553541567.10688 | 1553541567.10688 | 2      | up      | `http_req` | GET /favico...  | `4745542`... |           |
-| 1553541568.51422 | 1553541568.51422 | 2      | down    | `http_res` | HTTP/1.1 404... | `4854545`... |           |
-| 1553541569.4118  | 1553541569.5256  | 1      | down    | `http_res` | HTTP/1.1 200 OK | `4854545`... | `3c21`... |
+| Starttime        | Endtime          | ConnID | Up/down | State  | Notes           | Headings     | Data      |
+| ---------------- | ---------------- | ------ | ------- | -------| --------------- | ------------ | --------- |
+| 1553541453.1279  | 1553541453.1279  | 1      | up      | `http` | GET / HTTP/1.1  | `4745542`... |           |
+| 1553541567.10688 | 1553541567.10688 | 2      | up      | `http` | GET /favico...  | `4745542`... |           |
+| 1553541568.51422 | 1553541568.51422 | 2      | down    | `http` | HTTP/1.1 404... | `4854545`... |           |
+| 1553541569.4118  | 1553541569.5256  | 1      | down    | `http` | HTTP/1.1 200 OK | `4854545`... | `3c21`... |
 
 Sockpuppet applies two transformations that deviate from the literal data
 traveling over the socket:
