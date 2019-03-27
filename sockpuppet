@@ -68,7 +68,7 @@ sub stop
   $self;
 }
 
-sub elapsed
+sub time
 {
   my $self = shift;
   $$self{running} ? Time::HiRes::time() + $$self{time} : $$self{time};
@@ -98,12 +98,12 @@ sub fd_write
 
 sub print_timing_summary
 {
-  my $total          = total_runtime->elapsed || 1;
-  my $other_overhead = total_runtime->elapsed
-                     - http_rewrite_overhead->elapsed
-                     - follower_parse_overhead->elapsed
-                     - trace_overhead->elapsed
-                     - select_loop_time->elapsed;
+  my $total          = total_runtime->time || 1;
+  my $other_overhead = total_runtime->time
+                     - http_rewrite_overhead->time
+                     - follower_parse_overhead->time
+                     - trace_overhead->time
+                     - select_loop_time->time;
 
   printf STDERR q{
 TIMING SUMMARY
@@ -114,12 +114,12 @@ TIMING SUMMARY
     trace overhead:          %4.3fs (%.1f%%)
     other overhead:          %4.3fs (%.1f%%)} . "\n",
 
-    total_runtime->elapsed,
-    select_loop_time->elapsed,        select_loop_time->elapsed        / $total * 100,
-    http_rewrite_overhead->elapsed,   http_rewrite_overhead->elapsed   / $total * 100,
-    follower_parse_overhead->elapsed, follower_parse_overhead->elapsed / $total * 100,
-    trace_overhead->elapsed,          trace_overhead->elapsed          / $total * 100,
-    $other_overhead,                  $other_overhead                  / $total * 100;
+    total_runtime->time,
+    select_loop_time->time,        select_loop_time->time        / $total * 100,
+    http_rewrite_overhead->time,   http_rewrite_overhead->time   / $total * 100,
+    follower_parse_overhead->time, follower_parse_overhead->time / $total * 100,
+    trace_overhead->time,          trace_overhead->time          / $total * 100,
+    $other_overhead,               $other_overhead               / $total * 100;
 }
 
 
@@ -143,57 +143,14 @@ sub streamstate
   $stream_states{$_[0]} // die "nonexistent stream state: $_[0]";
 }
 
-defstreamstate http_length => sub
-{
-  # Log an event once we have the declared length-worth of stuff. If this state
-  # is in use, the follower will have two fields on it:
-  #
-  #   http_headers_
-  #   http_content_length_
 
-  my $f = shift;
-  if (length $_[0] == $$f{http_content_length_})
-  {
-    $f->event($$f{http_status_},
-              $$f{http_headers_},
-              $_[0]);
-    $_[0] = "";
-    return 'eof';
-  }
-  undef;
-};
-
-defstreamstate http_chunked => sub
-{
-  # Accumulate chunked data in memory until we get EOF. It isn't technically
-  # difficult to emit intermediate events, but it makes our output format
-  # noisier.
-  #
-  # This function is always invoked with the buffer placed at the beginning of a
-  # chunk header. Data is accumulated in $$f{http_chunked_buffer_}.
-
-  my $f = shift;
-  while ($_[0] =~ /^([0-9a-fA-F]+)\r\n/s)
-  {
-    my $h = $1;
-    my $n = hex $h;
-    if ($n)
-    {
-      $$f{http_chunked_buffer_} .= substr $_[0], length($h), $n;
-      $_[0] = substr $_[0], length($h) + $n + 4;
-    }
-    else
-    {
-      # End of stream
-      $f->event($$f{http_status_},
-                $$f{http_headers_},
-                $$f{http_chunked_buffer_});
-      $_[0] = "";
-      return 'eof';
-    }
-  }
-  undef;
-};
+# HTTP states
+# Depending on headers, the state progression looks like this:
+#
+# http -> http_length  -> eof -> closed
+#       | http_chunked -> eof -> closed
+#       | websocket    -> eof -> closed
+#       | eof                 -> closed
 
 defstreamstate http => sub
 {
@@ -244,6 +201,122 @@ defstreamstate http => sub
   }
 };
 
+defstreamstate http_length => sub
+{
+  # Log an event once we have the declared length-worth of stuff. If this state
+  # is in use, the follower will have three fields on it:
+  #
+  #   http_status_
+  #   http_headers_
+  #   http_content_length_
+
+  my $f = shift;
+  if (length $_[0] == $$f{http_content_length_})
+  {
+    $f->event($$f{http_status_},
+              $$f{http_headers_},
+              $_[0]);
+    $_[0] = "";
+    return 'eof';
+  }
+  undef;
+};
+
+defstreamstate http_chunked => sub
+{
+  # Accumulate chunked data in memory until we get EOF. It isn't technically
+  # difficult to emit intermediate events, but it makes our output format
+  # noisier and less straightforward to work with.
+  #
+  # This function is always invoked with the buffer placed at the beginning of a
+  # chunk header. Data is accumulated in $$f{http_chunked_buffer_}.
+
+  my $f = shift;
+  while ($_[0] =~ /^([0-9a-fA-F]+)\r\n/s)
+  {
+    my $h = $1;
+    my $n = hex $h;
+    if ($n)
+    {
+      $$f{http_chunked_buffer_} .= substr $_[0], length($h), $n;
+      $_[0] = substr $_[0], length($h) + $n + 4;
+    }
+    else
+    {
+      # End of stream
+      $f->event($$f{http_status_},
+                $$f{http_headers_},
+                $$f{http_chunked_buffer_});
+      $_[0] = "";
+      return 'eof';
+    }
+  }
+  undef;
+};
+
+
+# Websockets
+# Websockets are mostly straightforward, but there are a few nuances.
+#
+# First, the frame format is mostly fixed: it always begins with a single byte,
+# a length, an optional mask, and a payload; and the mask indicator is in a
+# fixed location. We don't need to understand every opcode to understand where
+# the frame boundaries are. Unfortunately, messages may be split across multiple
+# frames, possibly with interspersed control frames. So let's talk about that.
+#
+# The exact rules are at https://tools.ietf.org/html/rfc6455#section-5.4, but
+# here's the short version:
+#
+# Text and binary messages can be fragmented, which means we have a regular
+# non-FIN frame followed by one or more continuation frames, the last of which
+# has FIN set. Non-fragmented control frames can be present in between
+# continuation frames. This means we have a data channel sometimes duplexed with
+# control messages, so we need to maintain two separate start-times:
+#
+#   $data_start: time of first frame along data channel
+#   $ctrl_start: time of control frame data
+#
+# Our output timestamps can look like this:
+#
+#   |....fragmented_data_message..................|
+#            |control1|   |control2|   |control3|  |control4|
+#
+# Events are always written sorted by _end_ time; start times may not be fully
+# ordered.
+
+defstreamstate websocket => sub
+{
+  my $f = shift;
+  my ($start, $end) = @_[1, 2];
+
+  # We always have a byte to work with if this function is called. And we always
+  # need to grab it to track the data/ctrl start time, even if we don't have a
+  # full frame prefix.
+  my $opcode = 15 & unpack C => $_[0];
+  $$f{$opcode & 8 ? "ws_ctrl_start_" : "ws_data_start_"} //= $start;
+
+  # Early-exit for truncated frames.
+  return undef if length $_[0] < 2;
+  my $length = $_[0] =~ /^(.[\x00-\x7d\x80-\xfd])/s ? 0x7f & unpack xC => $_[0]
+             : $_[0] =~ /^(.[\x7e\xfe](..)/s        ? unpack  xxN   => $_[0]
+             : $_[0] =~ /^(.[\x7f\xff]........)/s   ? unpack "xxQ>" => $_[0]
+             :                                        return undef;
+  my $frame = $1;
+
+  # Early-exit for frames if we don't have the full payload available.
+  my $masked      = 0x80 & unpack xC => $_[0];
+  my $frame_bytes = $length + length($frame) + ($masked ? 4 : 0);
+  return undef unless length $_[0] >= $frame_bytes;
+
+  # ...aaaand finally, the moment we've all been waiting for...
+  # TODO: break the suspense
+};
+
+
+# EOF states
+# "eof" means the protocol has indicated that its datastream has ended; "closed"
+# means the underlying IO resource has been closed.
+
 defstreamstate closed => sub
 {
   die "no further data expected along (half?)closed socket: $_[1]";
@@ -283,7 +356,8 @@ sub new
 sub DESTROY
 {
   my $self = shift;
-  die "destroying an unclosed follower (connection ID = $$self{conn_id})"
+  die "destroying an unclosed follower with state $$self{state}, "
+    . "connection ID $$self{conn_id}"
     unless $$self{state} eq "closed";
 }
 
@@ -309,15 +383,17 @@ sub ping
 
 sub event
 {
-  # $self->event($notes, $headings, $data) -> $self
+  # $self->event($notes, $headings, $data[, $start, $end]) -> $self
   # Logs an event to the trace file, blocking until the full event has been
   # committed to the kernel. Track the amount of time we spend blocked here
   # (both CPU and IO).
   my $self = shift;
+  my ($start, $end) = @_ > 3 ? ($_[3], $_[4]) : ($$self{start}, $$self{end});
   sockpuppet::trace_overhead->start;
   sockpuppet::fd_write(
     $$self{trace_file},
-    join "\t", @$self{qw/start end conn_id updown state/},
+    join "\t", $start, $end,
+               @$self{qw/conn_id updown state/},
                $_[0] =~ y/\t/ /r,
                unpack("H*", $_[1]),
                unpack("H*", $_[2]) . "\n");
@@ -469,6 +545,10 @@ sub do_io
 
   if ($client_w && length $$self{downlink_buf})
   {
+    # Here and below, allow a partial write to take place. It's possible for us
+    # to have read stuff into the buffer, making it larger than the non-blocking
+    # write we get from select(). We might block if we forced everything using
+    # sockpuppet::fd_write.
     my $n = syswrite($$self{client_sock}, $$self{downlink_buf}) // die $!;
     $$self{downlink_buf} = substr $$self{downlink_buf}, $n;
   }
@@ -509,7 +589,7 @@ sub rewrite_http_request
   # Look for the \r?\n\r?\n sequence that marks end of HTTP headers. Once we
   # have that, we can rewrite our HTTP request and mark ourselves as having
   # decoded the outbound HTTP.
-  my ($http, $rest) = $$self{uplink_buf} =~ /^(.*)\r?\n\r?\n(.*)$/s
+  my ($http, $rest) = $$self{uplink_buf} =~ /^(.*?)\r?\n\r?\n(.*)$/s
     or return $self;
 
   $http =~ s/^(.*) HTTP\/2\S*$/^$1 HTTP\/1.1/;
@@ -519,7 +599,7 @@ sub rewrite_http_request
   $http .= "\nConnection: close";
   $$self{http_rewritten} = 1;
 
-  $$self{uplink_buf} = "$http\n\n$rest";
+  $$self{uplink_buf} = "$http\r\n\r\n$rest";
   $self;
 }
 
@@ -616,6 +696,8 @@ unless (caller)                         # nop if we're a library
 
   my ($desthost, $destport) = split /:/, $dest;
 
+  # WARNING: if you want to catch runtime signals like USR1 for incremental
+  # status updates, you'll need to make a bunch of code above retry on EINTR.
   $SIG{INT} = $SIG{TERM} = sub
   {
     sockpuppet::total_runtime->stop;
