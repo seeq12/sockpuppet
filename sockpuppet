@@ -80,6 +80,8 @@ sub time
 
 package sockpuppet;
 
+use List::Util qw/max/;
+
 use constant trace_overhead          => sockpuppet::timer->new;
 use constant http_rewrite_overhead   => sockpuppet::timer->new;
 use constant follower_parse_overhead => sockpuppet::timer->new;
@@ -99,11 +101,11 @@ sub fd_write
 sub print_timing_summary
 {
   my $total          = total_runtime->time || 1;
-  my $other_overhead = total_runtime->time
-                     - http_rewrite_overhead->time
-                     - follower_parse_overhead->time
-                     - trace_overhead->time
-                     - select_loop_time->time;
+  my $other_overhead = max 0, total_runtime->time
+                            - http_rewrite_overhead->time
+                            - follower_parse_overhead->time
+                            - trace_overhead->time
+                            - select_loop_time->time;
 
   printf STDERR q{
 TIMING SUMMARY
@@ -136,6 +138,8 @@ TIMING SUMMARY
 
 package sockpuppet;
 
+use List::Util qw/min/;
+
 our %stream_states;
 sub defstreamstate { $stream_states{$_[0]} = $_[1] }
 sub streamstate
@@ -152,13 +156,16 @@ sub streamstate
 #       | websocket    -> eof -> closed
 #       | eof                 -> closed
 
+use IO::Uncompress::Gunzip  qw/gunzip/;
+use IO::Uncompress::Inflate qw/inflate/;
+
 defstreamstate http => sub
 {
   # Once the headers have been parsed, we store http_headers_ and http_status_
   # on the follower. We also parse the content-length header if we transfer to
   # the http_length state.
   my $f = shift;
-  return undef unless $_[0] =~ /^(.*?)(\r?\n\r?\n)/s;
+  return undef unless $_[0] =~ /^(.*?\r?\n)(\r?\n)/s;
 
   $$f{http_headers_} = $1;
   $_[0] = substr $_[0], length($$f{http_headers_}) + length($2);
@@ -171,9 +178,22 @@ defstreamstate http => sub
   # 2. Content-Length found: set substate to "length"
   # 3. "Transfer-encoding: chunked" found: set substate to "chunked"
   # 4. No content length or transfer encoding: transition to EOF state
+  #
+  # Each of these terminates with either EOF state (for connection:close), or
+  # back to HTTP for keep-alive.
+  $$f{http_eof_state_} =
+    $$f{http_headers_} =~ /^connection\h*:\h*keep-alive/mi ? 'http' : 'eof';
 
-  if ($$f{http_headers_} =~ /connection\h*:\h*upgrade/i
-      && $$f{http_headers_} =~ /upgrade\h*:\h*websocket/i)
+  my ($encoding) = $$f{http_headers_} =~ /^content-encoding\h*:\h*(\w+)/mi;
+  $$f{http_decoder_} =
+      !defined $encoding     ? sub { shift }
+    : $encoding eq 'gzip'    ? sub { my ($i, $o) = shift; gunzip  \$i, \$o; $o }
+    : $encoding eq 'deflate' ? sub { my ($i, $o) = shift; inflate \$i, \$o; $o }
+    :                          sub { warn "unknown HTTP encoding: $encoding";
+                                     shift };
+
+  if ($$f{http_headers_} =~ /^connection\h*:\h*upgrade/mi
+      && $$f{http_headers_} =~ /^upgrade\h*:\h*websocket/mi)
   {
     # All set: we are now a websocket.
     delete $$f{http_state_};
@@ -197,27 +217,29 @@ defstreamstate http => sub
   else
   {
     $f->event($$f{http_status_}, $$f{http_headers_}, "");
-    return 'eof';
+    return $$f{http_eof_state_};
   }
 };
 
 defstreamstate http_length => sub
 {
   # Log an event once we have the declared length-worth of stuff. If this state
-  # is in use, the follower will have three fields on it:
+  # is in use, the follower will have five fields on it:
   #
   #   http_status_
   #   http_headers_
   #   http_content_length_
+  #   http_decoder_
+  #   http_eof_state_
 
   my $f = shift;
-  if (length $_[0] == $$f{http_content_length_})
+  if (length $_[0] >= $$f{http_content_length_})
   {
     $f->event($$f{http_status_},
               $$f{http_headers_},
-              $_[0]);
-    $_[0] = "";
-    return 'eof';
+              $$f{http_decoder_}->(substr $_[0], 0, $$f{http_content_length_}));
+    $_[0] = substr $_[0], $$f{http_content_length_};
+    return $$f{http_eof_state_};
   }
   undef;
 };
@@ -229,26 +251,31 @@ defstreamstate http_chunked => sub
   # noisier and less straightforward to work with.
   #
   # This function is always invoked with the buffer placed at the beginning of a
-  # chunk header. Data is accumulated in $$f{http_chunked_buffer_}.
+  # chunk header. Data is accumulated in $$f{http_chunked_buffer_}. We ignore
+  # all chunked transfer extensions.
 
   my $f = shift;
-  while ($_[0] =~ /^([0-9a-fA-F]+)\r\n/s)
+  while ($_[0] =~ /^([0-9a-fA-F]+)(;[^\r\n]*)?\r\n/s)
   {
-    my $h = $1;
-    my $n = hex $h;
+    my $h    = $1;
+    my $hlen = length($h) + length($2 // "") + 2;
+    my $n    = hex $h;
+    return undef if $hlen + $n + 2 > length $_[0];
+
     if ($n)
     {
-      $$f{http_chunked_buffer_} .= substr $_[0], length($h), $n;
-      $_[0] = substr $_[0], length($h) + $n + 4;
+      $$f{http_chunked_buffer_} .= substr $_[0], $hlen, $n;
+      $_[0] = substr $_[0], $hlen + $n + 2;
     }
     else
     {
       # End of stream
       $f->event($$f{http_status_},
                 $$f{http_headers_},
-                $$f{http_chunked_buffer_});
-      $_[0] = "";
-      return 'eof';
+                $$f{http_decoder_}->($$f{http_chunked_buffer_}));
+      $_[0] = substr $_[0], $hlen + 2;
+      $$f{http_chunked_buffer_} = undef;
+      return $$f{http_eof_state_};
     }
   }
   undef;
@@ -297,17 +324,21 @@ defstreamstate websocket => sub
   $$f{$opcode & 8 ? "ws_ctrl_start_" : "ws_data_start_"} //= $start;
 
   # Early-exit for truncated frames.
-  return undef if length $_[0] < 2;
-  my $length = $_[0] =~ /^(.[\x00-\x7d\x80-\xfd])/s ? 0x7f & unpack xC => $_[0]
-             : $_[0] =~ /^(.[\x7e\xfe](..)/s        ? unpack  xxN   => $_[0]
-             : $_[0] =~ /^(.[\x7f\xff]........)/s   ? unpack "xxQ>" => $_[0]
-             :                                        return undef;
-  my $frame = $1;
+  my $l = length $_[0];
+  return undef if $l < 2;
+
+  my $b1 = unpack xC => $_[0];
+  my ($fb, $length) =
+      ($b1 & 0x7f) < 126              ? (2,  $b1 & 0x7f)
+    : ($b1 & 0x7f) == 126 && $l >= 4  ? (4,  unpack  xxn   => $_[0])
+    : ($b1 & 0x7f) == 127 && $l >= 10 ? (10, unpack "xxQ>" => $_[0])
+    :                                   return undef;
+  my $frame = substr $_[0], 0, $fb;
 
   # Early-exit for frames if we don't have the full payload available.
-  my $masked      = 0x80 & unpack xC => $_[0];
+  my $masked      = $b1 & 0x80;
   my $frame_bytes = $length + length($frame) + ($masked ? 4 : 0);
-  return undef unless length $_[0] >= $frame_bytes;
+  return undef unless $l >= $frame_bytes;
 
   # ...aaaand finally, the moment we've all been waiting for.
   #
@@ -318,8 +349,10 @@ defstreamstate websocket => sub
                         : "";
   $payload ^= $mask if $masked;
 
+  $$f{ws_data_buffer_} //= "";
+
   # Commit by eating the frame from the data buffer
-  $_[0] = substr $_[0], length($frame) + ($masked ? 4 : 0);
+  $_[0] = substr $_[0], length($frame) + ($masked ? 4 : 0) + $length;
 
   # OK, now dispense with the data in one of four ways:
   #
@@ -339,7 +372,7 @@ defstreamstate websocket => sub
               $payload,
               $$f{ws_ctrl_start_}, $end);
     $$f{ws_ctrl_start_} = undef;
-    return $opcode == 8 ? 'eof' : undef;
+    return $opcode == 8 ? 'eof' : 'websocket';
   }
   elsif (!$fin && $opcode)
   {
@@ -349,25 +382,27 @@ defstreamstate websocket => sub
     $$f{ws_data_type_}   = $opcode == 1 ? "text"
                          : $opcode == 2 ? "binary"
                          :                "unknown $opcode";
-    return undef;
+    return 'websocket';
   }
   elsif (!$fin)
   {
     # Append to the buffer and we're done.
     $$f{ws_data_buffer_} .= $payload;
-    return undef;
+    return 'websocket';
   }
   else
   {
     # Event this puppy
-    $f->event($$f{ws_data_type_},
-              $$f{ws_data_header_},
+    $f->event($$f{ws_data_type_} // ($opcode == 1 ? "text"
+                                   : $opcode == 2 ? "binary"
+                                   :                "unknown $opcode"),
+              $$f{ws_data_header_} // $frame,
               $$f{ws_data_buffer_} . $payload,
-              $$f{ws_data_start_}, $end);
+              $$f{ws_data_start_} // $start, $end);
     $$f{ws_data_buffer_} = "";
     $$f{ws_data_type_}   = undef;
     $$f{ws_data_start_}  = undef;
-    return undef;
+    return 'websocket';
   }
 };
 
@@ -383,7 +418,8 @@ defstreamstate closed => sub
 
 defstreamstate eof => sub
 {
-  die "no further data expected beyond EOF: $_[1]";
+  warn "no further data expected beyond EOF: $_[1]";
+  undef;
 };
 
 
@@ -484,11 +520,6 @@ sub data
 sub close
 {
   my $self = shift->ping;
-  warn "closing a non-EOF follower with state $$self{state}, ID "
-     . "$$self{conn_id}; this usually means the protocol didn't have a chance "
-     . "to terminate before the socket was closed"
-  unless $$self{state} eq 'closed';
-
   $$self{state} = 'closed';
   return $self unless length $$self{buf};
 
@@ -653,17 +684,15 @@ sub rewrite_http_request
   # Look for the \r?\n\r?\n sequence that marks end of HTTP headers. Once we
   # have that, we can rewrite our HTTP request and mark ourselves as having
   # decoded the outbound HTTP.
-  my ($http, $rest) = $$self{uplink_buf} =~ /^(.*?)\r?\n\r?\n(.*)$/s
+  my ($http, $rest) = $$self{uplink_buf} =~ /^(.*?\r?\n)\r?\n(.*)$/s
     or return $self;
 
   $http =~ s/^(.*) HTTP\/2\S*$/^$1 HTTP\/1.1/;
-  $http =~ s/^Accept-Encoding:.*\n//m;
-  $http =~ s/^Connection:.*\n//m;
-  $http =~ s/^Host:.*/Host: $$self{host}/m;
-  $http .= "\nConnection: close";
+  $http =~ s/^host\h*:.*\n/Host: $$self{host}\r\n/im;
+  $http =~ s/^sec-websocket-extensions\h*:.*\n//im;
   $$self{http_rewritten} = 1;
 
-  $$self{uplink_buf} = "$http\r\n\r\n$rest";
+  $$self{uplink_buf} = "$http\r\n$rest";
   $self;
 }
 
@@ -770,7 +799,6 @@ unless (caller)                         # nop if we're a library
   };
 
   sockpuppet::total_runtime->start;
-  print STDERR "sockpuppet: starting proxy; Ctrl+C to exit\n";
   sockpuppet::proxy->new($listenport, $desthost, $destport)
                    ->io_loop;
 }
