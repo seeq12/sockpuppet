@@ -4,8 +4,6 @@ that can be parameterized to form things like unit and performance tests. The
 idea is that if you do something with a browser, you can automate it with
 sockpuppet.
 
-**NOTE:** still in development; not ready for production use yet.
-
 
 ## Usage
 ```sh
@@ -20,14 +18,11 @@ Sockpuppet isn't a completely transparent proxy. In particular, it applies a few
 HTTP-level transformations that make it easier to model the resulting traffic:
 
 1. HTTP/2 requests are rewritten as HTTP/1.1.
-2. The Host header is fixed up to represent the destination as sockpuppet sees
-   it, not as the browser connecting to sockpuppet.
-3. Connection-keepalive headers are removed from requests; we add a
-   connection-close header to force a separate datastream per request.
-4. "Accept-Encoding" headers are removed from requests. This disables compressed
-   replies from the server.
-
-Of these, (3) and (4) aren't strictly necessary but they do simplify analysis.
+2. The `Host:` header is fixed up to represent the destination as sockpuppet
+   sees it, not as the browser connecting to sockpuppet. Note that we don't fix
+   other headers, like `Origin` or `Referer`.
+3. `Sec-WebSocket-Extensions:` is removed from outbound requests. This disables
+   per-message deflate for now until I implement it.
 
 
 ## Output format
@@ -45,15 +40,16 @@ real outputs):
 | 1553541568.51422 | 1553541568.51422 | 2      | down    | `http` | HTTP/1.1 404... | `4854545`... |           |
 | 1553541569.4118  | 1553541569.5256  | 1      | down    | `http` | HTTP/1.1 200 OK | `4854545`... | `3c21`... |
 
-Sockpuppet applies two transformations that deviate from the literal data
+Sockpuppet applies three transformations that deviate from the literal data
 traveling over the socket:
 
 1. Chunked HTTP transfers are un-chunkified in the `data` column (both ways).
 2. Websocket packets are unmasked in `data` even though the `headings` column
-   may contain a frame with masking.
+   may contain a frame with masking. Any continuation frame headers are dropped.
+3. Deflate/gzip content is decoded.
 
 It's also worth noting that HTTP request headers are logged in their rewritten
-form to make the request/response conversation more coherent.
+form to make the request/response conversation more coherent/replayable.
 
 
 ## Authors
