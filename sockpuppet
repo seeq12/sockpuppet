@@ -36,37 +36,6 @@ use strict;
 use warnings;
 
 
-# CLI logic
-# Don't do anything if we're being used as a library.
-
-unless (caller)
-{
-  my ($listenport, $dest) = @ARGV;
-
-  unless ($listenport =~ /^\d+$/
-      and $dest       =~ /^\S+:\d+$/)
-  {
-    print STDERR "$0: invalid argument syntax @ARGV\n";
-    print STDERR "  (expected \"$0 sourceport desthost:destport\")\n";
-    exit 1;
-  }
-
-  my ($desthost, $destport) = split /:/, $dest;
-
-  $SIG{INT} = $SIG{TERM} = sub
-  {
-    sockpuppet::total_runtime->stop;
-    sockpuppet::print_timing_summary;
-    exit 0;
-  };
-
-  sockpuppet::total_runtime->start;
-  print STDERR "sockpuppet: starting proxy; Ctrl+C to exit\n";
-  sockpuppet::proxy->new($listenport, $desthost, $destport)
-                   ->io_loop;
-}
-
-
 # Accounting timer
 # Used internally to accumulate time spent doing various bookkeeping things
 # within sockpuppet. The idea is to figure out how much sockpuppet may have
@@ -74,7 +43,7 @@ unless (caller)
 
 package sockpuppet::timer;
 
-use Time::HiRes qw/time/;
+use Time::HiRes;
 
 sub new
 {
@@ -94,12 +63,12 @@ sub start
 sub stop
 {
   my $self = shift;
-  $$self{time} += Time::HiRes::time() if $$self{running}:
+  $$self{time} += Time::HiRes::time() if $$self{running};
   $$self{running} = 0;
   $self;
 }
 
-sub time
+sub elapsed
 {
   my $self = shift;
   $$self{running} ? Time::HiRes::time() + $$self{time} : $$self{time};
@@ -129,14 +98,15 @@ sub fd_write
 
 sub print_timing_summary
 {
-  my $total          = total_runtime->time || 1;
-  my $other_overhead = total_runtime->time
-                     - http_rewrite_overhead->time
-                     - follower_parse_overhead->time
-                     - trace_overhead->time
-                     - select_loop_time->time;
+  my $total          = total_runtime->elapsed || 1;
+  my $other_overhead = total_runtime->elapsed
+                     - http_rewrite_overhead->elapsed
+                     - follower_parse_overhead->elapsed
+                     - trace_overhead->elapsed
+                     - select_loop_time->elapsed;
 
-  printf STDERR q{TIMING SUMMARY
+  printf STDERR q{
+TIMING SUMMARY
     total runtime:           %4.3fs
     IO blocked:              %4.3fs (%.1f%%)
     HTTP rewrite overhead:   %4.3fs (%.1f%%)
@@ -144,12 +114,12 @@ sub print_timing_summary
     trace overhead:          %4.3fs (%.1f%%)
     other overhead:          %4.3fs (%.1f%%)} . "\n",
 
-    total_runtime->time,
-    select_loop_time->time,        select_loop_time->time        / $total * 100,
-    http_rewrite_overhead->time,   http_rewrite_overhead->time   / $total * 100,
-    follower_parse_overhead->time, follower_parse_overhead->time / $total * 100,
-    trace_overhead->time,          trace_overhead->time          / $total * 100,
-    $other_overhead,               $other_overhead               / $total * 100;
+    total_runtime->elapsed,
+    select_loop_time->elapsed,        select_loop_time->elapsed        / $total * 100,
+    http_rewrite_overhead->elapsed,   http_rewrite_overhead->elapsed   / $total * 100,
+    follower_parse_overhead->elapsed, follower_parse_overhead->elapsed / $total * 100,
+    trace_overhead->elapsed,          trace_overhead->elapsed          / $total * 100,
+    $other_overhead,                  $other_overhead                  / $total * 100;
 }
 
 
@@ -167,7 +137,7 @@ sub print_timing_summary
 package sockpuppet;
 
 our %stream_states;
-sub defstreamstate { $stream_state{+shift} = shift }
+sub defstreamstate { $stream_states{$_[0]} = $_[1] }
 sub streamstate
 {
   $stream_states{$_[0]} // die "nonexistent stream state: $_[0]";
@@ -188,7 +158,7 @@ defstreamstate http_length => sub
               $$f{http_headers_},
               $_[0]);
     $_[0] = "";
-    'eof';
+    return 'eof';
   }
   undef;
 };
@@ -256,7 +226,7 @@ defstreamstate http => sub
   elsif ($$f{http_headers_} =~ /^content-length\h*:\h*(\d+)/mi)
   {
     $$f{http_content_length_} = $1;
-    $f->event("content-length: $$f{http_content_length}",
+    $f->event("content-length: $$f{http_content_length_}",
               $$f{http_headers_},
               "");
     return 'http_length';
@@ -300,7 +270,7 @@ sub new
 {
   my ($class, $trace_file, $conn_id, $updown, $state) = @_;
   sockpuppet::streamstate $state;       # assert that it exists
-  bless { trace_file => $file,
+  bless { trace_file => $trace_file,
           conn_id    => $conn_id,
           pair       => undef,
           updown     => $updown,
@@ -308,6 +278,13 @@ sub new
           buf        => "",
           start      => undef,
           end        => undef}, $class;
+}
+
+sub DESTROY
+{
+  my $self = shift;
+  die "destroying an unclosed follower (connection ID = $$self{conn_id})"
+    unless $$self{state} eq "closed";
 }
 
 sub pair { shift->{pair} }
@@ -337,14 +314,14 @@ sub event
   # committed to the kernel. Track the amount of time we spend blocked here
   # (both CPU and IO).
   my $self = shift;
-  trace_overhead->start;
+  sockpuppet::trace_overhead->start;
   sockpuppet::fd_write(
     $$self{trace_file},
-    join "\t", @$self{"start", "end", "conn_id", "updown", "state"},
+    join "\t", @$self{qw/start end conn_id updown state/},
                $_[0] =~ y/\t/ /r,
                unpack("H*", $_[1]),
                unpack("H*", $_[2]) . "\n");
-  trace_overhead->stop;
+  sockpuppet::trace_overhead->stop;
   $self;
 }
 
@@ -356,12 +333,12 @@ sub data
   # Parse link state. If we get a state change, collapse our timeframe on the
   # assumption that the most recent data caused that change. Each state change
   # also triggers a reparse under the new state.
-  while (1)
+  while (length $$self{buf})
   {
-    follower_parse_overhead->start;
+    sockpuppet::follower_parse_overhead->start;
     my $s = sockpuppet::streamstate($$self{state})->(
               $self, @$self{"buf", "start", "end"});
-    follower_parse_overhead->stop;
+    sockpuppet::follower_parse_overhead->stop;
 
     return $self unless defined $s;
     sockpuppet::streamstate($$self{state} = $s);
@@ -395,8 +372,8 @@ sub new
 {
   my ($class, $trace_file, $host, $client_sock, $server_sock) = @_;
   my $id    = $connection_id++;
-  my $upf   = sockpuppet::follower->new($trace_file, $id, up   => 'http_req');
-  my $downf = sockpuppet::follower->new($trace_file, $id, down => 'http_res');
+  my $upf   = sockpuppet::follower->new($trace_file, $id, up   => 'http');
+  my $downf = sockpuppet::follower->new($trace_file, $id, down => 'http');
 
   bless { up_follower    => $upf->pair_with($downf),
           down_follower  => $downf->pair_with($upf),
@@ -621,6 +598,35 @@ sub io_loop
 {
   my $self = shift;
   $self->io_step while 1;
+}
+
+
+# CLI logic
+unless (caller)                         # nop if we're a library
+{
+  my ($listenport, $dest) = @ARGV;
+
+  unless ($listenport =~ /^\d+$/
+      and $dest       =~ /^\S+:\d+$/)
+  {
+    print STDERR "$0: invalid argument syntax @ARGV\n";
+    print STDERR "  (expected \"$0 sourceport desthost:destport\")\n";
+    exit 1;
+  }
+
+  my ($desthost, $destport) = split /:/, $dest;
+
+  $SIG{INT} = $SIG{TERM} = sub
+  {
+    sockpuppet::total_runtime->stop;
+    sockpuppet::print_timing_summary;
+    exit 0;
+  };
+
+  sockpuppet::total_runtime->start;
+  print STDERR "sockpuppet: starting proxy; Ctrl+C to exit\n";
+  sockpuppet::proxy->new($listenport, $desthost, $destport)
+                   ->io_loop;
 }
 
 
