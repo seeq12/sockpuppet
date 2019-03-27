@@ -52,85 +52,268 @@ unless (caller)
   }
 
   my ($desthost, $destport) = split /:/, $dest;
+
+  $SIG{INT} = $SIG{TERM} = sub
+  {
+    sockpuppet::total_runtime->stop;
+    sockpuppet::print_timing_summary;
+    exit 0;
+  };
+
+  sockpuppet::total_runtime->start;
   sockpuppet::proxy->new($listenport, $desthost, $destport)
                    ->io_loop;
 }
 
 
-# Output stream
-# Logs information about a specific TCP connection. The output file is written
-# sequentially and safely, assuming you don't access it from multiple threads.
-#
-# TODO: have output streams take on a parsing and interpreting role, for
-# instance characterizing the nature of HTTP requests/replies (e.g. JSON
-# objects) and decoding stuff like chunked encodings and websockets.
+# Accounting timer
+# Used internally to accumulate time spent doing various bookkeeping things
+# within sockpuppet. The idea is to figure out how much sockpuppet may have
+# contributed to any performance reduction that occurred while using it.
 
-package sockpuppet::ostream;
+package sockpuppet::timer;
+
 use Time::HiRes qw/time/;
-
-our $stream_id = 0;
 
 sub new
 {
-  my ($class, $file) = @_;
-  my $self = bless { file => $file,
-                     id   => ++$stream_id }, $class;
-  $self->connect;
+  my ($class) = @_;
+  bless { running => 0,
+          time    => 0 }, $class;
+}
+
+sub start
+{
+  my $self = shift;
+  $$self{time} -= Time::HiRes::time() unless $$self{running};
+  $$self{running} = 1;
   $self;
 }
 
-sub write
+sub stop
 {
   my $self = shift;
-  my $file = $$self{file};
+  $$self{time} += Time::HiRes::time() if $$self{running}:
+  $$self{running} = 0;
+  $self;
+}
+
+sub time
+{
+  my $self = shift;
+  $$self{running} ? Time::HiRes::time() + $$self{time} : $$self{time};
+}
+
+
+# Utilities/globals
+# Stuff for file descriptors, etc.
+
+package sockpuppet;
+
+use constant trace_overhead          => sockpuppet::timer->new;
+use constant http_rewrite_overhead   => sockpuppet::timer->new;
+use constant follower_parse_overhead => sockpuppet::timer->new;
+use constant select_loop_time        => sockpuppet::timer->new;
+use constant total_runtime           => sockpuppet::timer->new;
+
+sub fd_write
+{
+  # fd_write($fd, $buf): write the entirety of a buffer to fd, retrying as long
+  # as we get partial writes. Die if we encounter a write error.
+  my $file = shift;
   for (my ($offset, $len, $n) = (0, length $_[0], 0);
        $len and $n = syswrite($file, $_[0], $len, $offset) // die $!;
        $offset += $n, $len -= $n) {}
+}
+
+sub print_timing_summary
+{
+  my $total          = total_runtime->time || 1;
+  my $other_overhead = total_runtime->time
+                     - http_rewrite_overhead->time
+                     - follower_parse_overhead->time
+                     - trace_overhead->time
+                     - select_loop_time->time;
+
+  printf STDERR q{TIMING SUMMARY
+    total runtime:           %4.3fs
+    IO blocked:              %4.3fs (%.1f%%)
+    HTTP rewrite overhead:   %4.3fs (%.1f%%)
+    follower parse overhead: %4.3fs (%.1f%%)
+    trace overhead:          %4.3fs (%.1f%%)
+    other overhead:          %4.3fs (%.1f%%)} . "\n",
+
+    total_runtime->time,
+    select_loop_time->time,        select_loop_time->time        / $total * 100,
+    http_rewrite_overhead->time,   http_rewrite_overhead->time   / $total * 100,
+    follower_parse_overhead->time, follower_parse_overhead->time / $total * 100,
+    trace_overhead->time,          trace_overhead->time          / $total * 100,
+    $other_overhead,               $other_overhead               / $total * 100;
+}
+
+
+# Unidirectional stream states
+# A finite state machine of functions that parse follower-buffered data and emit
+# next states and write events. Each has this signature:
+#
+#   ($follower, $data, $starttime, $endtime) -> state' | undef
+#
+# If the function returns a new state, it should update $data in place.
+#
+# Some state functions stash data on the follower object for performance
+# reasons; when they do, the keys will end with an underscore.
+
+package sockpuppet;
+
+our %stream_states;
+sub defstreamstate { $stream_state{+shift} = shift }
+sub streamstate
+{
+  $stream_states{$_[0]} // die "nonexistent stream state: $_[0]";
+}
+
+defstreamstate http_length => sub
+{
+  # Log an event once we have the declared length-worth of stuff.
+  my $f = shift;
+
+
+  ($$f{content_length}) = $_[0] =~ /Content-Length\s*:\s*(\d+)/i
+    unless exists $$f{content_length};
+
+
+  # Do we have all the content we expected? If so, log it and we're done.
+  
+};
+
+defstreamstate http_req => sub
+{
+  my $f = shift;
+};
+
+defstreamstate http_res => sub
+{
+  my $f = shift;
+};
+
+defstreamstate eof => sub
+{
+  die "no further data expected beyond EOF: $_[1]";
+};
+
+
+# Stream follower
+# Parses and emits data for a unidirectional datastream within a TCP connection.
+# Followers are paired with the other-directional datastream so they can verify
+# state for things like handshaking protocols -- e.g. websocket setup and
+# ping/pong events.
+
+package sockpuppet::follower;
+
+use Scalar::Util qw/weaken/;
+use Time::HiRes  qw/time/;
+
+sub new
+{
+  my ($class, $trace_file, $conn_id, $updown, $state) = @_;
+  sockpuppet::streamstate $state;       # assert that it exists
+  bless { trace_file => $file,
+          conn_id    => $conn_id,
+          pair       => undef,
+          updown     => $updown,
+          state      => $state,
+          buf        => "",
+          start      => undef,
+          end        => undef}, $class;
+}
+
+sub pair { shift->{pair} }
+
+sub pair_with
+{
+  my $self = shift;
+  weaken($$self{pair} = shift);
   $self;
 }
 
-sub connect
+sub ping
 {
-  my ($self) = @_;
-  $self->write("$$self{id} connecting at " . time() . "\n");
-}
-
-sub upload
-{
+  # Update timing information even if no data is observable yet. This is used to
+  # notify the follower that socket IO is happening but in a buffered/pending
+  # state -- such as when sockpuppet::connection is collecting HTTP request data
+  # but hasn't yet rewritten it.
   my $self = shift;
-  $self->write("$$self{id} up: " . length($_[0]) . " byte(s)\n");
+  $$self{start} //= ($$self{end} = time());
+  $self;
 }
 
-sub download
+sub event
 {
+  # $self->event($notes, $headings, $data) -> $self
+  # Logs an event to the trace file, blocking until the full event has been
+  # committed to the kernel. Track the amount of time we spend blocked here
+  # (both CPU and IO).
   my $self = shift;
-  $self->write("$$self{id} down: " . length($_[0]) . " byte(s)\n");
+  trace_overhead->start;
+  sockpuppet::fd_write(
+    $$self{trace_file},
+    join "\t", @$self{"start", "end", "connid", "updown", "state"},
+               $_[0],
+               unpack("H*", $_[1]),
+               unpack("H*", $_[2]) . "\n");
+  trace_overhead->stop;
+  $self;
 }
 
-sub disconnect
+sub data
 {
-  my ($self) = @_;
-  $self->write("$$self{id} disconnecting at " . time() . "\n");
+  my $self = shift->ping;
+  $$self{buf} .= shift;
+
+  # Parse link state. If we get a state change, collapse our timeframe on the
+  # assumption that the most recent data caused that change.
+  follower_parse_overhead->start;
+  my $s = sockpuppet::streamstate($$self{state})->(
+            $self, @$self{"buf", "start", "end"});
+  follower_parse_overhead->stop;
+
+  return $self unless defined $s;
+  sockpuppet::streamstate($$self{state} = $s);
+  $$self{start} = $$self{end};
+  $self;
 }
 
-sub log
+sub close
 {
-  my $self = shift;
-  $self->write("$$self{id} LOG at " . time() . "\n" . join("\n", @_) . "\n");
+  my $self = shift->ping;
+  return $self unless length $$self{buf};
+
+  # If we have data in the buffer, it means we failed to process something. Log
+  # the current state with a note about unexpected EOF.
+  $self->event("unexpected EOF", "", $$self{buf});
 }
 
 
 # TCP connection class
-# Manages data capture and protocol decoding.
+# Forwards data bidirectionally along a single TCP stream, capturing traffic
+# each way and applying minimal HTTP rewriting in the process. This class
+# manages read/write buffering and delegates parsing to sockpuppet::follower.
 
 package sockpuppet::connection;
 
 use constant BUF_LIMIT => 65536;
+our $connection_id = 0;
 
 sub new
 {
-  my ($class, $ostream, $host, $client_sock, $server_sock) = @_;
-  bless { ostream        => $ostream,
+  my ($class, $trace_file, $host, $client_sock, $server_sock) = @_;
+  my $id    = $connection_id++;
+  my $upf   = sockpuppet::follower->new($trace_file, $id, up   => 'http_req');
+  my $downf = sockpuppet::follower->new($trace_file, $id, down => 'http_res');
+
+  bless { up_follower    => $upf->pair_with($downf),
+          down_follower  => $downf->pair_with($upf),
+          connection_id  => $id,
           client_sock    => $client_sock,
           server_sock    => $server_sock,
           client_fd      => fileno $client_sock,
@@ -154,7 +337,6 @@ sub close
   close $$self{client_sock};
   close $$self{server_sock};
 
-  $$self{ostream}->disconnect;
   $$self{client_sock} = $$self{server_sock} = undef;
   $self;
 }
@@ -174,6 +356,9 @@ sub prepare_select_write
 {
   # ($self, $read_fd_vec, $err_fd_vec, $write_fd_vec)
   my $self = shift;
+
+  # Important: set write bits only when the paired FDs are readable. Otherwise
+  # we'll spin-wait for inbound data.
   vec($_[2], $$self{client_fd}, 1) = 1 if vec $_[0], $$self{server_fd}, 1;
   vec($_[2], $$self{server_fd}, 1) = 1 if vec $_[0], $$self{client_fd}, 1;
   $self;
@@ -192,14 +377,15 @@ sub do_io
   # If we have errors, close the connection and auto-implode.
   return $self->close if $client_e || $server_e;
 
-  # First handle downlink. We don't parse this.
+  # First handle downlink. We don't parse this here, but it does have a
+  # follower.
   my $downbuf_size = length $$self{downlink_buf};
   if ($server_r && $downbuf_size < BUF_LIMIT)
   {
     sysread $$self{server_sock}, $$self{downlink_buf},
             BUF_LIMIT - $downbuf_size, $downbuf_size
       or return $self->close;
-    $$self{ostream}->download(substr $$self{downlink_buf}, $downbuf_size);
+    $$self{down_follower}->data(substr $$self{downlink_buf}, $downbuf_size);
   }
 
   if ($client_w && length $$self{downlink_buf})
@@ -217,16 +403,19 @@ sub do_io
             $upbuf_size
       or return $self->close;
 
-    # The ostream's uplink follower gets original data, not our rewritten
-    # request. This shouldn't be a problem given the limited nature of our
-    # rewrites, but it's worth noting.
-    $$self{ostream}->upload(substr $$self{uplink_buf}, $upbuf_size);
+    # Start the up-follower timer as soon as we get the first piece of data,
+    # even though we may have to wait for more data before we can ->data the
+    # follower (since it gets rewritten headers). This helps minimize timing
+    # errors for HTTP requests that span IO delays.
+    $$self{up_follower}->ping;
+
     $self->rewrite_http_request unless $$self{http_rewritten};
   }
 
   if ($$self{http_rewritten} && $server_w)
   {
     my $n = syswrite($$self{server_sock}, $$self{uplink_buf}) // die $!;
+    $$self{up_follower}->data(substr $$self{uplink_buf}, $upbuf_size);
     $$self{uplink_buf} = substr $$self{uplink_buf}, $n;
   }
 
@@ -274,7 +463,7 @@ sub new
   my $dest_paddr = sockaddr_in $dest_port, inet_aton $dest_host || die "no host: $dest_host";
 
   bless { connections   => [],
-          output_stream => sockpuppet::ostream->new(\*STDOUT),
+          trace_file    => \*STDOUT,
           dest_paddr    => $dest_paddr,
           dest_host     => $dest_host,
           dest_port     => $dest_port,
@@ -296,10 +485,14 @@ sub io_loop
 
     @$cs = grep $_->is_ok, @$cs;
     $_->prepare_select_read($rfds, $efds) for @$cs;
+    sockpuppet::select_loop_time->start;
     select $rfds, undef, $efds, undef;
+    sockpuppet::select_loop_time->stop;
 
     $_->prepare_select_write($rfds, $efds, $wfds) for @$cs;
+    sockpuppet::select_loop_time->start;
     select undef, $wfds, undef, undef if unpack "%32b*", $wfds;
+    sockpuppet::select_loop_time->stop;
 
     # First, do IO on existing connections.
     $_->do_io($rfds, $wfds, $efds) for @$cs;
@@ -314,7 +507,7 @@ sub io_loop
       connect   $server_sock, $$self{dest_paddr}                         or die "connect: $!";
 
       push @$cs, sockpuppet::connection->new(
-                   sockpuppet::ostream->new(\*STDOUT),
+                   $$self{trace_file},
                    "$$self{dest_host}:$$self{dest_port}",
                    $client_sock,
                    $server_sock);
