@@ -451,8 +451,8 @@ sub new
 sub DESTROY
 {
   my $self = shift;
-  die "destroying an unclosed follower with state $$self{state}, "
-    . "connection ID $$self{conn_id}"
+  warn "destroying an unclosed follower with state $$self{state}, "
+     . "connection ID $$self{conn_id}"
     unless $$self{state} eq "closed";
 }
 
@@ -537,7 +537,12 @@ sub close
 package sockpuppet::connection;
 
 use constant BUF_LIMIT => 65536;
-our $connection_id = 0;
+
+# Choose a semi-random starting point for connection IDs, but push the
+# randomness up beyond the realistic range of incremented numbers. The logic
+# here is to be able to generally differentiate between subsequent runs of
+# sockpuppet, but still have connection IDs that are easy to mentally track.
+our $connection_id = $$ * 1_000_000_000;
 
 sub new
 {
@@ -572,13 +577,15 @@ sub close
   {
     # Download data is written to the follower on read, so no need to write it
     # here.
-    sockpuppet::fd_write $$self{client_sock}, $$self{downlink_buf};
+    eval { sockpuppet::fd_write $$self{client_sock}, $$self{downlink_buf} };
+    warn "fd_write: $@" if $@;
   }
 
   if (length $$self{uplink_buf})
   {
     $$self{up_follower}->data($$self{uplink_buf});
-    sockpuppet::fd_write $$self{server_sock}, $$self{uplink_buf};
+    eval { sockpuppet::fd_write $$self{server_sock}, $$self{uplink_buf} };
+    warn "fd_write: $@" if $@;
   }
 
   $$self{down_follower}->close;
@@ -644,7 +651,8 @@ sub do_io
     # to have read stuff into the buffer, making it larger than the non-blocking
     # write we get from select(). We might block if we forced everything using
     # sockpuppet::fd_write.
-    my $n = syswrite($$self{client_sock}, $$self{downlink_buf}) // die $!;
+    my $n = syswrite($$self{client_sock}, $$self{downlink_buf})
+         // $self->implode($!);
     $$self{downlink_buf} = substr $$self{downlink_buf}, $n;
   }
 
@@ -668,7 +676,8 @@ sub do_io
 
   if ($$self{http_rewritten} && $server_w)
   {
-    my $n = syswrite($$self{server_sock}, $$self{uplink_buf}) // die $!;
+    my $n = syswrite($$self{server_sock}, $$self{uplink_buf}) //
+         // $self->implode($!);
     $$self{up_follower}->data(substr $$self{uplink_buf}, $upbuf_size);
     $$self{uplink_buf} = substr $$self{uplink_buf}, $n;
   }
@@ -694,6 +703,13 @@ sub rewrite_http_request
 
   $$self{uplink_buf} = "$http\r\n$rest";
   $self;
+}
+
+sub implode
+{
+  my $self = shift;
+  warn "connection imploding: @_";
+  $self->close;
 }
 
 
@@ -770,7 +786,11 @@ sub io_step
 sub io_loop
 {
   my $self = shift;
-  $self->io_step while 1;
+  while (1)
+  {
+    eval { $self->io_step };
+    warn $@ if $@;
+  }
 }
 
 
