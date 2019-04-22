@@ -676,7 +676,7 @@ sub do_io
 
   if ($$self{http_rewritten} && $server_w)
   {
-    my $n = syswrite($$self{server_sock}, $$self{uplink_buf}) //
+    my $n = syswrite($$self{server_sock}, $$self{uplink_buf})
          // $self->implode($!);
     $$self{up_follower}->data(substr $$self{uplink_buf}, $upbuf_size);
     $$self{uplink_buf} = substr $$self{uplink_buf}, $n;
